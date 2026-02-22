@@ -54,19 +54,25 @@ def now_ist():
 # 🔑 CREDENTIALS — loaded from environment variables
 # ══════════════════════════════════════════════════════════════════════
 
-CLIENT_ID    = os.getenv("DHAN_CLIENT_ID",    "1106812224")
-ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", (
-    "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9"
-    ".eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcxNTY0NDY3"
-    ".AAunRW0B-2epXeclux7ewL9NHZ_d0d-zTlWVcR1IKnbkXO8V4TZRpACiiZc7"
-    "KS-0xulm4nGqM7lM5Rm7lA-T8g"
-))
+CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "1106812224")
 
-HEADERS = {
-    "access-token": ACCESS_TOKEN,
-    "client-id":    CLIENT_ID,
-    "Content-Type": "application/json"
-}
+def get_token():
+    """Always reads latest token — from file (updated via dashboard) or env variable."""
+    token_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dhan_token.txt")
+    if os.path.exists(token_file):
+        with open(token_file) as f:
+            t = f.read().strip()
+        if t:
+            return t
+    return os.getenv("DHAN_ACCESS_TOKEN", "")
+
+
+def get_headers():
+    return {
+        "access-token": get_token(),
+        "client-id":    CLIENT_ID,
+        "Content-Type": "application/json"
+    }
 
 # ══════════════════════════════════════════════════════════════════════
 # ⚙️  STRATEGY PARAMETERS (from Backtest v6 — do not change lightly)
@@ -287,7 +293,7 @@ def fetch_spot(lookback_days=5):
                 "fromDate": start,
                 "toDate": end
             },
-            headers=HEADERS, timeout=30
+            headers=get_headers(), timeout=30
         )
         if r.status_code != 200:
             log.error(f"Spot API {r.status_code}: {r.text[:100]}")
@@ -316,7 +322,7 @@ def fetch_option_price(security_id):
                 "fromDate": start,
                 "toDate": end
             },
-            headers=HEADERS, timeout=20
+            headers=get_headers(), timeout=20
         )
         if r.status_code != 200:
             return None
