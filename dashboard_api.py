@@ -1,17 +1,15 @@
 """
 Dashboard API — Serves trading data to dashboard.html
 Run this alongside bot.py on Railway.
-
-Add to Procfile:
-  web: python dashboard_api.py
-  worker: python bot.py
 """
 
 from flask import Flask, jsonify, send_from_directory
-import sqlite3, os, json
+import sqlite3, os, json, pathlib
 
-app = Flask(__name__)
-DB_FILE = "trading.db"
+BASE_DIR = pathlib.Path(__file__).parent.resolve()
+app      = Flask(__name__, static_folder=str(BASE_DIR), static_url_path="")
+DB_FILE  = str(BASE_DIR / "trading.db")
+STATE_F  = str(BASE_DIR / "bot_state.json")
 
 def query(sql, args=()):
     if not os.path.exists(DB_FILE):
@@ -24,7 +22,7 @@ def query(sql, args=()):
 
 @app.route("/")
 def index():
-    return send_from_directory(".", "dashboard.html")
+    return send_from_directory(str(BASE_DIR), "dashboard.html")
 
 @app.route("/api/dashboard")
 def dashboard():
@@ -38,14 +36,12 @@ def dashboard():
         FROM trades GROUP BY unit
     """)
 
-    # Build unit stats with current capital
-    state_file = "bot_state.json"
     unit_stats = []
-    if os.path.exists(state_file):
-        with open(state_file) as f:
+    if os.path.exists(STATE_F):
+        with open(STATE_F) as f:
             state = json.load(f)
         for u in state["units"]:
-            matched = next((r for r in unit_rows if r["uid"]==u["uid"]), None)
+            matched = next((r for r in unit_rows if r["uid"] == u["uid"]), None)
             unit_stats.append({
                 "uid":     u["uid"],
                 "capital": u["capital"],
@@ -54,17 +50,17 @@ def dashboard():
             })
     else:
         for i in range(5):
-            matched = next((r for r in unit_rows if r["uid"]==i), None)
+            matched = next((r for r in unit_rows if r["uid"] == i), None)
             unit_stats.append({
-                "uid": i, "capital": 20000 + (matched["pnl"] if matched else 0),
-                "pnl": matched["pnl"] if matched else 0,
-                "trades": matched["trades"] if matched else 0
+                "uid":     i,
+                "capital": 20000 + (matched["pnl"] if matched else 0),
+                "pnl":     matched["pnl"] if matched else 0,
+                "trades":  matched["trades"] if matched else 0
             })
 
-    # Build equity timeline from trades
     equity = []
     eq = 100000
-    for t in sorted(trades, key=lambda x: x["exit_time"]):
+    for t in sorted(trades, key=lambda x: x["exit_time"] or ""):
         eq += t["pnl"]
         equity.append({"ts": t["exit_time"], "eq": eq})
 
