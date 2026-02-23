@@ -22,7 +22,8 @@ from strategy import add_indicators, get_signal, synth_premium, \
 from data import fetch_spot, ContractSelector, PriceCache
 from units import UnitManager
 import alerts
-
+import os
+print(os.listdir())
 
 # ══════════════════════════════════════════════════════
 # 📝  LOGGING
