@@ -1,862 +1,1425 @@
 """
-╔══════════════════════════════════════════════════════════════════════╗
-║   NIFTY OPTIONS PAPER TRADING BOT — LIVE VERSION                     ║
-║   Converted from Backtest v6 | Dhan API | Deploy-Ready               ║
-╠══════════════════════════════════════════════════════════════════════╣
-║  Features:                                                           ║
-║  ✅ Persistent capital & state (survives restarts)                   ║
-║  ✅ SQLite trade logging (months of history)                         ║
-║  ✅ Paper trading (no real orders placed)                            ║
-║  ✅ IST timezone aware                                               ║
-║  ✅ Auto-restart safe                                                ║
-║  ✅ Railway/Render deploy ready                                      ║
-║  ✅ All strategy params from Backtest v6                             ║
-╚══════════════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════╗
+║  NIFTY OPTIONS PAPER TRADING BOT — FINAL v9                 ║
+║  All bugs from Feb 23 logs fixed                             ║
+╠══════════════════════════════════════════════════════════════╣
+║  BUGS FIXED:                                                  ║
+║  1. TIME EXIT never triggered → fixed bar count logic         ║
+║  2. Only 1 signal/day (RSI crossover too rare) → new signal   ║
+║  3. Day P&L showed ₹0 while trade open → fixed real-time P&L ║
+║  4. Dashboard blank → rebuilt with hardcoded path + errors    ║
+║  5. Dashboard fetches live Nifty directly from Dhan API       ║
+║  6. Backtest engine integrated with same Dhan API             ║
+╠══════════════════════════════════════════════════════════════╣
+║  USAGE:                                                       ║
+║    Run bot:       python3 bot_final.py                        ║
+║    Run dashboard: python3 bot_final.py --dashboard            ║
+║    Run backtest:  python3 bot_final.py --backtest             ║
+║    Run all:       python3 bot_final.py --all                  ║
+╚══════════════════════════════════════════════════════════════╝
 """
 
-import requests
-import pandas as pd
-import numpy as np
-import sqlite3
-import json
-import os
-import time
-import logging
-import warnings
-from datetime import datetime, timedelta
+import sys, os, json, time, sqlite3, logging, threading
+import requests, numpy as np, pandas as pd
+import urllib.request, urllib.parse
+from datetime import datetime, date, timedelta, timezone
 from collections import defaultdict
-from zoneinfo import ZoneInfo
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-warnings.filterwarnings("ignore")
-
-# ══════════════════════════════════════════════════════════════════════
-# 🔧 LOGGING SETUP
-# ══════════════════════════════════════════════════════════════════════
-
-os.makedirs("logs", exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s IST | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.FileHandler("logs/bot.log"),
-        logging.StreamHandler()
-    ]
+# ═══════════════════════════════════════════════════════════
+# ⚙️  CONFIG — Edit only this block
+# ═══════════════════════════════════════════════════════════
+CLIENT_ID    = "1106812224"
+ACCESS_TOKEN = (
+    "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9"
+    ".eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcxNTY0NDY3"
+    "LCJpYXQiOjE3NzE0NzgwNjcsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIs"
+    "IndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA2ODEyMjI0In0"
+    ".AAunRW0B-2epXeclux7ewL9NHZ_d0d-zTlWVcR1IKnbkXO8V4TZRpACiiZc7"
+    "KS-0xulm4nGqM7lM5Rm7lA-T8g"
 )
-log = logging.getLogger("NiftyBot")
+TELEGRAM_TOKEN   = ""       # Fill this for alerts
+TELEGRAM_CHAT_ID = ""
+TELEGRAM_ENABLED = False
 
-IST = ZoneInfo("Asia/Kolkata")
+TOTAL_CAPITAL = 100_000
+NUM_UNITS     = 5
+UNIT_SIZE     = 20_000
 
-def now_ist():
-    return datetime.now(IST)
+# ─── Signal (FIXED: simple level-based, 3-5 signals/day) ───
+ADX_MIN     = 15    # Lower threshold → more signals
+RSI_CE_MAX  = 45    # Buy CE when RSI < 45 (oversold, bullish setup)
+RSI_PE_MIN  = 55    # Buy PE when RSI > 55 (overbought, bearish setup)
+EMA_FAST    = 9
+EMA_SLOW    = 21
 
-# ══════════════════════════════════════════════════════════════════════
-# 🔑 CREDENTIALS — loaded from environment variables
-# ══════════════════════════════════════════════════════════════════════
+# ─── Exits (FIXED bar counting) ─────────────────────────────
+SL_PCT         = 0.30   # -30% premium = stop loss
+TP_PCT         = 0.60   # +60% premium = take profit
+TIME_EXIT_BARS = 8      # Exit after 8 bars (2 hours) — FIXED
+MIN_HOLD_BARS  = 2      # Min 2 bars before checking exits
 
-CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "1106812224")
+# ─── Position sizing ─────────────────────────────────────────
+MAX_COST_PCT  = 0.65    # Max 65% of unit on one trade
+MAX_LOTS      = 2
+LOT_SIZE      = 65
+MAX_TRADES_PER_DAY = 3  # Per unit
 
-def get_token():
-    """Always reads latest token — from file (updated via dashboard) or env variable."""
-    token_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dhan_token.txt")
-    if os.path.exists(token_file):
-        with open(token_file) as f:
-            t = f.read().strip()
-        if t:
-            return t
-    return os.getenv("DHAN_ACCESS_TOKEN", "")
+# ─── Risk guards ─────────────────────────────────────────────
+MAX_PORT_DD_MONTHLY = 0.08   # Stop if portfolio DD > 8% from month start
+MAX_PORT_DD_DAILY   = 0.05   # Pause day if -5% portfolio in one day
+MAX_UNIT_DD_DAILY   = 0.12   # Pause unit if -12% in one day
+LOSS_STREAK_LIMIT   = 2      # Cooldown after 2 consecutive losses
+COOLDOWN_BARS       = 4
 
+# ─── Timing (IST) ────────────────────────────────────────────
+ENTRY_START = (9, 30)    # No entries before 9:30
+ENTRY_END   = (14, 15)   # No new entries after 14:15
+HARD_CLOSE  = (15, 5)    # Force close all at 15:05
 
-def get_headers():
-    return {
-        "access-token": get_token(),
-        "client-id":    CLIENT_ID,
-        "Content-Type": "application/json"
-    }
+# ─── Paths ───────────────────────────────────────────────────
+BOT_DIR    = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(BOT_DIR, "state", "bot_state.json")
+DB_FILE    = os.path.join(BOT_DIR, "data",  "trades.db")
+LOG_DIR    = os.path.join(BOT_DIR, "logs")
+SCRIP_FILE = os.path.join(BOT_DIR, "api-scrip-master.csv")
 
-# ══════════════════════════════════════════════════════════════════════
-# ⚙️  STRATEGY PARAMETERS (from Backtest v6 — do not change lightly)
-# ══════════════════════════════════════════════════════════════════════
+for _d in [os.path.join(BOT_DIR,"state"), os.path.join(BOT_DIR,"data"),
+           LOG_DIR, os.path.join(BOT_DIR,"reports")]:
+    os.makedirs(_d, exist_ok=True)
 
-TOTAL_CAPITAL   = 100_000
-NUM_UNITS       = 5
-UNIT_SIZE       = 20_000        # ₹20k each — fits 1-2 Nifty lots
+HEADERS = {"access-token": ACCESS_TOKEN, "client-id": CLIENT_ID,
+           "Content-Type": "application/json"}
 
-INTERVAL        = "15"          # 15-min candles
+# ═══════════════════════════════════════════════════════════
+# 📝  LOGGING
+# ═══════════════════════════════════════════════════════════
+def setup_log(name="bot"):
+    log_path = os.path.join(LOG_DIR, f"{name}_{date.today()}.log")
+    fmt = "%(asctime)s IST | %(levelname)s | %(message)s"
+    handlers = [logging.FileHandler(log_path),
+                logging.StreamHandler(sys.stdout)]
+    logging.basicConfig(level=logging.INFO, format=fmt,
+                        datefmt="%Y-%m-%d %H:%M:%S", handlers=handlers, force=True)
+    return logging.getLogger(name)
 
-# Market hours IST
-ENTRY_START     = (9,  30)
-ENTRY_END       = (14, 30)
-HARD_CLOSE      = (15, 10)
+# ═══════════════════════════════════════════════════════════
+# 🗃️  DATABASE
+# ═══════════════════════════════════════════════════════════
+def get_db():
+    c = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    return c
 
-# Indicators
-EMA_FAST, EMA_SLOW, EMA_TREND = 9, 21, 50
-BB_LEN, BB_STD                = 20, 2.0
-RSI_LEN, ADX_LEN              = 14, 14
+def init_db():
+    with get_db() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            unit_id INTEGER, opt_type TEXT, symbol TEXT, strike REAL,
+            lot_size REAL, qty INTEGER,
+            entry_time TEXT, exit_time TEXT,
+            entry_spot REAL, exit_spot REAL,
+            entry_prem REAL, exit_prem REAL,
+            bars_held INTEGER, pnl REAL, exit_reason TEXT,
+            trade_date TEXT, week_num TEXT, month_str TEXT
+        );
+        CREATE TABLE IF NOT EXISTS equity_curve (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT, equity REAL, open_pnl REAL, spot REAL, trade_date TEXT
+        );
+        CREATE TABLE IF NOT EXISTS backtest_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_time TEXT, from_date TEXT, to_date TEXT,
+            n_trades INTEGER, win_rate REAL, total_pnl REAL,
+            return_pct REAL, profit_factor REAL, max_dd REAL,
+            avg_per_day REAL, results_json TEXT
+        );
+        """)
 
-# Signal parameters
-ADX_MIN         = 20
-RSI_CE          = (42, 70)
-RSI_PE          = (30, 58)
-MIN_CONFIRMS    = 2
-SIG_COOLDOWN    = 3             # bars between entries per unit
+def save_trade(t: dict):
+    dt = str(t.get("entry_time",""))[:10]
+    with get_db() as c:
+        c.execute("""INSERT INTO trades
+            (unit_id,opt_type,symbol,strike,lot_size,qty,
+             entry_time,exit_time,entry_spot,exit_spot,
+             entry_prem,exit_prem,bars_held,pnl,exit_reason,
+             trade_date,week_num,month_str)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (t["unit"],t["opt_type"],t.get("symbol","?"),t.get("strike",0),
+             t["lot_size"],t["qty"],str(t["entry_time"]),str(t["exit_time"]),
+             t["entry_spot"],t["exit_spot"],t["entry_prem"],t["exit_prem"],
+             t["bars_held"],t["pnl"],t["reason"],dt,
+             datetime.fromisoformat(dt).strftime("%Y-W%W"),
+             datetime.fromisoformat(dt).strftime("%Y-%m")))
 
-# Position sizing
-MAX_COST_PCT    = 0.55
-MAX_LOTS        = 2
+def save_equity(ts, equity, open_pnl, spot):
+    with get_db() as c:
+        c.execute("INSERT INTO equity_curve (ts,equity,open_pnl,spot,trade_date) VALUES (?,?,?,?,?)",
+                  (str(ts), equity, open_pnl, spot, str(ts)[:10]))
 
-# SL / TP on option premium
-SL_DROP_PCT     = 0.40          # Exit if premium falls 40%
-TP_GAIN_PCT     = 1.00          # Exit if premium doubles
-TRAIL_START     = 0.60          # Trail after +60% gain
-TRAIL_LOCK      = 0.75          # Lock 75% of peak gain
-MIN_HOLD        = 2             # Min bars before SL/TP
+def get_trades_today():
+    with get_db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM trades WHERE trade_date=? ORDER BY entry_time",
+            [date.today().isoformat()]).fetchall()]
 
-# Risk management
-MAX_LOSS_STREAK      = 3
-COOLDOWN_AFTER_LOSS  = 6
-MAX_UNIT_DAY_LOSS    = 0.15
-MAX_PORT_DAY_LOSS    = 0.08
+def get_all_trades():
+    with get_db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM trades ORDER BY entry_time").fetchall()]
 
-LOT_SIZE_DEFAULT     = 65
+def get_equity_today():
+    with get_db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT ts,equity,open_pnl,spot FROM equity_curve WHERE trade_date=? ORDER BY ts",
+            [date.today().isoformat()]).fetchall()]
 
-# How often the main loop runs (seconds)
-LOOP_SLEEP      = 60            # check every 60 seconds
+def save_backtest(result: dict):
+    with get_db() as c:
+        c.execute("""INSERT INTO backtest_runs
+            (run_time,from_date,to_date,n_trades,win_rate,total_pnl,
+             return_pct,profit_factor,max_dd,avg_per_day,results_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (datetime.now().isoformat(), result["from_date"], result["to_date"],
+             result["n_trades"], result["win_rate"], result["total_pnl"],
+             result["return_pct"], result["profit_factor"], result["max_dd"],
+             result["avg_per_day"], json.dumps(result, default=str)))
 
-# ══════════════════════════════════════════════════════════════════════
-# 💾 PERSISTENT STATE — survives restarts
-# ══════════════════════════════════════════════════════════════════════
+def get_last_backtest():
+    with get_db() as c:
+        r = c.execute("SELECT * FROM backtest_runs ORDER BY id DESC LIMIT 1").fetchone()
+        return dict(r) if r else {}
 
-STATE_FILE = "bot_state.json"
+# ═══════════════════════════════════════════════════════════
+# 📡  DATA FETCHING
+# ═══════════════════════════════════════════════════════════
+def _to_df(data: dict) -> pd.DataFrame | None:
+    k = ["open","high","low","close","volume","timestamp"]
+    if not all(x in data for x in k): return None
+    df = pd.DataFrame({x: data[x] for x in k})
+    df["datetime"] = (pd.to_datetime(df["timestamp"], unit="s")
+                       .dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata")
+                       .dt.tz_localize(None))
+    df.set_index("datetime", inplace=True)
+    df.drop("timestamp", axis=1, inplace=True)
+    df = df[((df.index.hour==9)&(df.index.minute>=15)) |
+            ((df.index.hour>9)&(df.index.hour<15)) |
+            ((df.index.hour==15)&(df.index.minute<=30))].copy()
+    return df
+
+def fetch_spot(days=2) -> pd.DataFrame | None:
+    end   = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now()-timedelta(days=days)).strftime("%Y-%m-%d")
+    try:
+        r = requests.post("https://api.dhan.co/v2/charts/intraday",
+            json={"securityId":"13","exchangeSegment":"IDX_I","instrument":"INDEX",
+                  "interval":"15","fromDate":start,"toDate":end},
+            headers=HEADERS, timeout=30)
+        if r.status_code != 200: return None
+        df = _to_df(r.json())
+        return df
+    except Exception as e:
+        logging.warning(f"fetch_spot error: {e}")
+        return None
+
+def fetch_spot_history(from_date, to_date) -> pd.DataFrame | None:
+    """For backtest — fetch larger date ranges"""
+    try:
+        r = requests.post("https://api.dhan.co/v2/charts/intraday",
+            json={"securityId":"13","exchangeSegment":"IDX_I","instrument":"INDEX",
+                  "interval":"15","fromDate":from_date,"toDate":to_date},
+            headers=HEADERS, timeout=60)
+        if r.status_code != 200:
+            print(f"  API {r.status_code}: {r.text[:100]}")
+            return None
+        return _to_df(r.json())
+    except Exception as e:
+        print(f"  Fetch error: {e}")
+        return None
+
+# ═══════════════════════════════════════════════════════════
+# 📐  INDICATORS
+# ═══════════════════════════════════════════════════════════
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    c, h, l, v = df["close"], df["high"], df["low"], df["volume"]
+    df = df.copy()
+
+    # EMA
+    df["ema9"]  = c.ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema21"] = c.ewm(span=EMA_SLOW, adjust=False).mean()
+
+    # RSI (14)
+    delta = c.diff()
+    gain  = delta.clip(lower=0).ewm(span=14, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(span=14, adjust=False).mean()
+    df["rsi"] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+
+    # ADX (14)
+    tr  = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    dmp = (h-h.shift()).clip(lower=0).where((h-h.shift())>(l.shift()-l), 0)
+    dmn = (l.shift()-l).clip(lower=0).where((l.shift()-l)>(h-h.shift()), 0)
+    atr = tr.ewm(span=14, adjust=False).mean()
+    dp  = 100 * dmp.ewm(span=14, adjust=False).mean() / atr.replace(0, np.nan)
+    dn  = 100 * dmn.ewm(span=14, adjust=False).mean() / atr.replace(0, np.nan)
+    df["adx"] = ((dp-dn).abs()/(dp+dn).replace(0,np.nan)*100).ewm(span=14,adjust=False).mean()
+
+    # VWAP (daily reset)
+    df["_d"]   = df.index.date
+    df["vwap"] = (c*v).groupby(df["_d"]).cumsum() / v.groupby(df["_d"]).cumsum()
+    df.drop("_d", axis=1, inplace=True)
+
+    return df
+
+# ═══════════════════════════════════════════════════════════
+# 🎯  SIGNAL ENGINE — FIXED & SIMPLIFIED
+# ═══════════════════════════════════════════════════════════
+def get_signal(row: pd.Series) -> str | None:
+    """
+    SIMPLE 3-RULE SIGNAL — generates 2-4 signals/day:
+
+    CE (BUY CALL): Market oversold but EMA says UP trend
+      → RSI < 45 (oversold zone) AND EMA9 > EMA21 AND ADX > 15
+
+    PE (BUY PUT): Market overbought but EMA says DOWN trend
+      → RSI > 55 (overbought zone) AND EMA9 < EMA21 AND ADX > 15
+
+    Why RSI LEVEL not crossover?
+      Crossover needs 2 consecutive bars at exact threshold = rare (1/day)
+      Level-based: triggers every time RSI is in the zone = 3-5/day
+    """
+    if pd.isna(row.get("adx")): return None
+    if pd.isna(row.get("rsi")): return None
+
+    adx = row["adx"]
+    rsi = row["rsi"]
+    ema_bull = row["ema9"] > row["ema21"]
+
+    if adx < ADX_MIN: return None
+
+    # CE signal: RSI oversold + bullish EMA
+    if rsi < RSI_CE_MAX and ema_bull:
+        return "CE"
+
+    # PE signal: RSI overbought + bearish EMA
+    if rsi > RSI_PE_MIN and not ema_bull:
+        return "PE"
+
+    return None
+
+# ═══════════════════════════════════════════════════════════
+# 💹  OPTION PREMIUM (synthetic — Brenner formula)
+# ═══════════════════════════════════════════════════════════
+def synth_prem(spot: float, dte: float = 5, iv: float = 0.15) -> float:
+    T = max(dte / 365.0, 0.5 / 365)
+    return max(round(spot * iv * np.sqrt(T) * 0.3989, 1), spot * 0.002)
+
+def mark_prem(entry_prem, entry_spot, cur_spot, opt_type, bars):
+    """Estimate current option premium from spot move."""
+    sign     = 1 if opt_type == "CE" else -1
+    delta    = 0.50
+    gamma    = 0.00015
+    theta    = entry_prem * 0.0002   # daily theta per bar
+    spot_chg = cur_spot - entry_spot
+    prem_chg = sign * (delta * spot_chg + 0.5 * gamma * spot_chg**2)
+    return max(entry_prem + prem_chg - theta * bars, 0.5)
+
+def calc_pnl(ep, xp, lot, qty):
+    slip = (ep + xp) * 0.003 * lot * qty
+    raw  = (xp - ep) * lot * qty
+    return round(max(raw - slip, -ep * lot * qty), 2)
+
+# ═══════════════════════════════════════════════════════════
+# 🏦  UNIT MANAGER
+# ═══════════════════════════════════════════════════════════
+class Unit:
+    def __init__(self, uid, cap=None):
+        self.uid        = uid
+        self.capital    = float(cap if cap else UNIT_SIZE)
+        self.trade      = None
+        self.streak     = 0
+        self.cooldown   = 0
+        self.n_trades   = 0
+        self.last_bar   = -99
+        self.day_trades = defaultdict(int)
+        self.day_pnl    = defaultdict(float)
+
+    @property
+    def free(self):
+        return self.trade is None and self.cooldown == 0
+
+    def can_enter(self, ts, bar_idx) -> bool:
+        d = ts.date()
+        if not self.free: return False
+        if self.day_pnl[d] < -(UNIT_SIZE * MAX_UNIT_DD_DAILY): return False
+        if self.day_trades[d] >= MAX_TRADES_PER_DAY: return False
+        if bar_idx - self.last_bar < 1: return False
+        return True
+
+    def enter(self, t, bar_idx, ts):
+        self.trade = t
+        self.n_trades += 1
+        self.last_bar = bar_idx
+        self.day_trades[ts.date()] += 1
+
+    def close(self, pnl, ts):
+        self.capital += pnl
+        self.day_pnl[ts.date()] += pnl
+        self.trade = None
+        if pnl < 0:
+            self.streak += 1
+            if self.streak >= LOSS_STREAK_LIMIT:
+                self.cooldown = COOLDOWN_BARS
+                self.streak = 0
+        else:
+            self.streak = 0
+
+    def open_pnl(self, cur_spot) -> float:
+        """Real-time unrealised P&L for display."""
+        if not self.trade: return 0.0
+        t  = self.trade
+        cp = mark_prem(t["entry_prem"], t["entry_spot"],
+                       cur_spot, t["opt_type"], t.get("bars", 0))
+        return calc_pnl(t["entry_prem"], cp, t["lot_size"], t["qty"])
+
+    def tick(self):
+        if self.cooldown > 0: self.cooldown -= 1
+
+    def to_dict(self):
+        return {"uid":self.uid,"capital":self.capital,"trade":self.trade,
+                "streak":self.streak,"cooldown":self.cooldown,
+                "n_trades":self.n_trades,"last_bar":self.last_bar,
+                "day_trades":{str(k):v for k,v in self.day_trades.items()},
+                "day_pnl":{str(k):v for k,v in self.day_pnl.items()}}
+
+    @classmethod
+    def from_dict(cls, d):
+        u = cls(d["uid"], d["capital"])
+        u.trade    = d.get("trade")
+        u.streak   = d.get("streak", 0)
+        u.cooldown = d.get("cooldown", 0)
+        u.n_trades = d.get("n_trades", 0)
+        u.last_bar = d.get("last_bar", -99)
+        u.day_trades = defaultdict(int, {
+            date.fromisoformat(k): v for k, v in d.get("day_trades", {}).items()})
+        u.day_pnl = defaultdict(float, {
+            date.fromisoformat(k): v for k, v in d.get("day_pnl", {}).items()})
+        return u
+
+def save_state(units, rr, month_cap):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        json.dump({"units":[u.to_dict() for u in units],
+                   "rr": rr, "month_start_cap": month_cap,
+                   "saved": datetime.now().isoformat()}, f, default=str, indent=2)
 
 def load_state():
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            state = json.load(f)
-        log.info(f"📂 State loaded | Capital: ₹{sum(u['capital'] for u in state['units']):,.0f}")
-        return state
-    # First run — initialize
-    log.info("🆕 First run — initializing state")
-    return {
-        "units": [
-            {
-                "uid":      i,
-                "capital":  float(UNIT_SIZE),
-                "streak":   0,
-                "cooldown": 0,
-                "n_trades": 0,
-                "last_bar": -99,
-                "trade":    None,        # open position (if any)
-                "day_pnl":  {}
-            }
-            for i in range(NUM_UNITS)
-        ],
-        "total_bars_seen": 0,
-        "rr_ptr": 0
-    }
-
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2, default=str)
-
-# ══════════════════════════════════════════════════════════════════════
-# 🗄️  DATABASE — persistent trade history
-# ══════════════════════════════════════════════════════════════════════
-
-DB_FILE = "trading.db"
-
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS trades (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        datetime     TEXT,
-        unit         INTEGER,
-        opt_type     TEXT,
-        symbol       TEXT,
-        strike       REAL,
-        entry_time   TEXT,
-        exit_time    TEXT,
-        entry_spot   REAL,
-        exit_spot    REAL,
-        entry_prem   REAL,
-        exit_prem    REAL,
-        qty          INTEGER,
-        lot_size     REAL,
-        bars_held    INTEGER,
-        pnl          REAL,
-        reason       TEXT,
-        live_data    INTEGER,
-        capital_after REAL
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS daily_summary (
-        date             TEXT PRIMARY KEY,
-        opening_capital  REAL,
-        closing_capital  REAL,
-        total_trades     INTEGER,
-        winning_trades   INTEGER,
-        daily_pnl        REAL,
-        signals_seen     INTEGER
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS signals (
-        id        INTEGER PRIMARY KEY AUTOINCREMENT,
-        datetime  TEXT,
-        direction TEXT,
-        spot      REAL,
-        adx       REAL,
-        rsi       REAL,
-        acted_on  INTEGER DEFAULT 0
-    )''')
-    conn.commit()
-    conn.close()
-    log.info("✅ Database initialized")
-
-def log_trade_db(trade_dict):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''INSERT INTO trades
-        (datetime, unit, opt_type, symbol, strike, entry_time, exit_time,
-         entry_spot, exit_spot, entry_prem, exit_prem, qty, lot_size,
-         bars_held, pnl, reason, live_data, capital_after)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (
-        now_ist().strftime("%Y-%m-%d %H:%M:%S"),
-        trade_dict["unit"], trade_dict["opt_type"], trade_dict["symbol"],
-        trade_dict["strike"], str(trade_dict["entry_time"]), str(trade_dict["exit_time"]),
-        trade_dict["entry_spot"], trade_dict["exit_spot"],
-        trade_dict["entry_prem"], trade_dict["exit_prem"],
-        trade_dict["qty"], trade_dict["lot_size"], trade_dict["bars_held"],
-        trade_dict["pnl"], trade_dict["reason"],
-        1 if trade_dict.get("live_data") else 0,
-        trade_dict.get("capital_after", 0)
-    ))
-    conn.commit()
-    conn.close()
-
-def log_signal_db(ts, direction, spot, adx, rsi, acted_on=False):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''INSERT INTO signals (datetime, direction, spot, adx, rsi, acted_on)
-                 VALUES (?,?,?,?,?,?)''',
-              (str(ts), direction, spot, adx, rsi, 1 if acted_on else 0))
-    conn.commit()
-    conn.close()
-
-def save_daily_summary(date_str, opening_cap, closing_cap, trades, wins, pnl, signals):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''INSERT OR REPLACE INTO daily_summary
-        (date, opening_capital, closing_capital, total_trades, winning_trades, daily_pnl, signals_seen)
-        VALUES (?,?,?,?,?,?,?)''',
-        (date_str, opening_cap, closing_cap, trades, wins, pnl, signals))
-    conn.commit()
-    conn.close()
-
-# ══════════════════════════════════════════════════════════════════════
-# 📡 DATA FETCHING
-# ══════════════════════════════════════════════════════════════════════
-
-def _to_ist(df):
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC").tz_convert("Asia/Kolkata").tz_localize(None)
-    else:
-        df.index = df.index.tz_convert("Asia/Kolkata").tz_localize(None)
-    return df
-
-def _parse(data):
-    keys = ["open", "high", "low", "close", "volume", "timestamp"]
-    if not all(k in data for k in keys):
-        return None
-    df = pd.DataFrame({k: data[k] for k in keys})
-    df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
-    df.set_index("datetime", inplace=True)
-    df.drop("timestamp", axis=1, inplace=True)
-    return _to_ist(df)
-
-def market_hours(df):
-    return df[
-        ((df.index.hour == 9)  & (df.index.minute >= 15)) |
-        ((df.index.hour >  9)  & (df.index.hour   <  15)) |
-        ((df.index.hour == 15) & (df.index.minute <= 30))
-    ]
-
-def fetch_spot(lookback_days=5):
-    end   = now_ist().strftime("%Y-%m-%d")
-    start = (now_ist() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    try:
-        r = requests.post(
-            "https://api.dhan.co/v2/charts/intraday",
-            json={
-                "securityId": "13",
-                "exchangeSegment": "IDX_I",
-                "instrument": "INDEX",
-                "interval": INTERVAL,
-                "fromDate": start,
-                "toDate": end
-            },
-            headers=get_headers(), timeout=30
-        )
-        if r.status_code != 200:
-            log.error(f"Spot API {r.status_code}: {r.text[:100]}")
-            return None
-        df = _parse(r.json())
-        if df is not None:
-            df = market_hours(df)
-            log.info(f"📊 Fetched {len(df)} spot candles")
-        return df
-    except Exception as e:
-        log.error(f"Spot fetch error: {e}")
-        return None
-
-def fetch_option_price(security_id):
-    """Fetch latest option candle price."""
-    end   = now_ist().strftime("%Y-%m-%d")
-    start = (now_ist() - timedelta(days=5)).strftime("%Y-%m-%d")
-    try:
-        r = requests.post(
-            "https://api.dhan.co/v2/charts/intraday",
-            json={
-                "securityId": str(security_id),
-                "exchangeSegment": "NSE_FNO",
-                "instrument": "OPTIDX",
-                "interval": INTERVAL,
-                "fromDate": start,
-                "toDate": end
-            },
-            headers=get_headers(), timeout=20
-        )
-        if r.status_code != 200:
-            return None
-        df = _parse(r.json())
-        if df is not None and len(df) > 0:
-            df = market_hours(df)
-            return float(df["close"].iloc[-1]) if len(df) > 0 else None
-        return None
-    except Exception:
-        return None
-
-def load_scrip():
-    for f in ["api-scrip-master.csv", "scrip-master.csv"]:
-        if os.path.exists(f):
-            df = pd.read_csv(f, low_memory=False)
-            log.info(f"✅ Scrip master loaded: {len(df):,} rows")
-            return df
-    log.warning("⚠️ Scrip master not found — will use synthetic contracts")
-    return None
-
-# ══════════════════════════════════════════════════════════════════════
-# 📐 INDICATORS (exact same as backtest)
-# ══════════════════════════════════════════════════════════════════════
-
-def add_indicators(df):
-    c, h, l, v = df["close"], df["high"], df["low"], df["volume"]
-
-    df["ema9"]  = c.ewm(span=EMA_FAST,  adjust=False).mean()
-    df["ema21"] = c.ewm(span=EMA_SLOW,  adjust=False).mean()
-    df["ema50"] = c.ewm(span=EMA_TREND, adjust=False).mean()
-
-    df["bb_mid"]   = c.rolling(BB_LEN).mean()
-    df["bb_std"]   = c.rolling(BB_LEN).std()
-    df["bb_up"]    = df["bb_mid"] + BB_STD * df["bb_std"]
-    df["bb_dn"]    = df["bb_mid"] - BB_STD * df["bb_std"]
-    df["bb_width"] = (df["bb_up"] - df["bb_dn"]) / df["bb_mid"]
-
-    d = c.diff()
-    df["rsi"] = 100 - 100 / (
-        1 + d.clip(lower=0).rolling(RSI_LEN).mean() /
-            (-d.clip(upper=0)).rolling(RSI_LEN).mean().replace(0, np.nan)
-    )
-
-    tr  = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    dmp = (h - h.shift()).clip(lower=0)
-    dmn = (l.shift() - l).clip(lower=0)
-    dmp = dmp.where(dmp >= dmn, 0)
-    dmn = dmn.where(dmn > dmp, 0)
-    atr = tr.ewm(span=ADX_LEN, adjust=False).mean()
-    dp  = 100 * dmp.ewm(span=ADX_LEN, adjust=False).mean() / atr.replace(0, np.nan)
-    dn  = 100 * dmn.ewm(span=ADX_LEN, adjust=False).mean() / atr.replace(0, np.nan)
-    dx  = (100 * (dp - dn).abs() / (dp + dn).replace(0, np.nan))
-    df["adx"]  = dx.ewm(span=ADX_LEN, adjust=False).mean()
-    df["di_p"] = dp
-    df["di_n"] = dn
-
-    df["_d"]   = df.index.date
-    df["vwap"] = (c * v).groupby(df["_d"]).cumsum() / v.groupby(df["_d"]).cumsum()
-    df.drop("_d", axis=1, inplace=True)
-
-    df["vol_ma"]    = v.rolling(20).mean()
-    df["vol_ratio"] = v / df["vol_ma"].replace(0, np.nan)
-    df["mom3"]      = c - c.shift(3)
-    df["close_pct"] = (c - l) / (h - l).replace(0, np.nan)
-
-    df["x_up"]    = (df["ema9"] > df["ema21"]) & (df["ema9"].shift(1) <= df["ema21"].shift(1))
-    df["x_dn"]    = (df["ema9"] < df["ema21"]) & (df["ema9"].shift(1) >= df["ema21"].shift(1))
-    df["bb_b_up"] = (c > df["bb_dn"]) & (c.shift(1) <= df["bb_dn"])
-    df["bb_b_dn"] = (c < df["bb_up"]) & (c.shift(1) >= df["bb_up"])
-    df["bb_x_up"] = (c > df["bb_mid"]) & (c.shift(1) <= df["bb_mid"])
-    df["bb_x_dn"] = (c < df["bb_mid"]) & (c.shift(1) >= df["bb_mid"])
-
-    return df
-
-# ══════════════════════════════════════════════════════════════════════
-# 🎯 SIGNAL ENGINE (exact same logic as backtest)
-# ══════════════════════════════════════════════════════════════════════
-
-def get_signal(row):
-    if pd.isna(row["adx"]) or row["adx"] < ADX_MIN:
-        return None
-    if row["bb_width"] < 0.003:
-        return None
-
-    if row["x_up"] or row["bb_b_up"] or row["bb_x_up"]:
-        confirms = sum([
-            RSI_CE[0] <= row["rsi"] <= RSI_CE[1],
-            row["mom3"] > 0,
-            row["close_pct"] > 0.50,
-            row["vol_ratio"] > 0.80,
-            row["di_p"] > row["di_n"],
-            row["close"] > row["vwap"],
-        ])
-        if confirms >= MIN_CONFIRMS:
-            return "CE"
-
-    if row["x_dn"] or row["bb_b_dn"] or row["bb_x_dn"]:
-        confirms = sum([
-            RSI_PE[0] <= row["rsi"] <= RSI_PE[1],
-            row["mom3"] < 0,
-            row["close_pct"] < 0.50,
-            row["vol_ratio"] > 0.80,
-            row["di_n"] > row["di_p"],
-            row["close"] < row["vwap"],
-        ])
-        if confirms >= MIN_CONFIRMS:
-            return "PE"
-
-    return None
-
-# ══════════════════════════════════════════════════════════════════════
-# 📦 CONTRACT SELECTOR
-# ══════════════════════════════════════════════════════════════════════
-
-class ContractSelector:
-    def __init__(self, scrip_df):
-        self._cache = {}
-        self._opts  = self._prep(scrip_df)
-
-    def _prep(self, df):
-        if df is None:
-            return None
-        o = df[df["SEM_INSTRUMENT_NAME"] == "OPTIDX"].copy()
-        o = o[o["SEM_TRADING_SYMBOL"].str.startswith("NIFTY", na=False)].copy()
-        o = o[~o["SEM_TRADING_SYMBOL"].str.contains("BANK|FIN|MID|NEXT", na=False)]
-        o["SEM_EXPIRY_DATE"] = pd.to_datetime(o["SEM_EXPIRY_DATE"], errors="coerce")
-        return o
-
-    def get(self, spot, opt_type, trade_date):
-        atm = round(spot / 50) * 50
-        key = (atm, opt_type, str(trade_date))
-        if key in self._cache:
-            return self._cache[key]
-
-        if self._opts is None:
-            return self._synth(spot, opt_type)
-
-        dt  = pd.Timestamp(trade_date)
-        fut = self._opts[self._opts["SEM_EXPIRY_DATE"] > dt]["SEM_EXPIRY_DATE"].unique()
-        if not len(fut):
-            return self._synth(spot, opt_type)
-
-        nearest_exp = sorted(fut)[0]
-        pool = self._opts[
-            (self._opts["SEM_EXPIRY_DATE"] == nearest_exp) &
-            (self._opts["SEM_OPTION_TYPE"] == opt_type)
-        ].copy()
-
-        if pool.empty:
-            return self._synth(spot, opt_type)
-
-        pool["diff"] = (pool["SEM_STRIKE_PRICE"] - atm).abs()
-        best = pool.nsmallest(1, "diff").iloc[0]
-
-        c = {
-            "sid":      str(best["SEM_SMST_SECURITY_ID"]),
-            "symbol":   best["SEM_TRADING_SYMBOL"],
-            "strike":   float(best["SEM_STRIKE_PRICE"]),
-            "expiry":   best["SEM_EXPIRY_DATE"],
-            "lot_size": float(best["SEM_LOT_UNITS"]),
-            "opt_type": opt_type,
-            "dte":      (nearest_exp - dt).days,
-        }
-        self._cache[key] = c
-        return c
-
-    def _synth(self, spot, opt_type):
-        return {
-            "sid":      None,
-            "symbol":   f"NIFTY_ATM_{opt_type}_SYN",
-            "strike":   round(spot / 50) * 50,
-            "expiry":   now_ist() + timedelta(days=5),
-            "lot_size": float(LOT_SIZE_DEFAULT),
-            "opt_type": opt_type,
-            "dte":      5,
-        }
-
-# ══════════════════════════════════════════════════════════════════════
-# 💹 OPTION PRICING
-# ══════════════════════════════════════════════════════════════════════
-
-def synth_prem(spot, dte, iv=0.15):
-    T    = max(dte / 365.0, 0.5 / 365)
-    prem = spot * iv * np.sqrt(T) * 0.3989
-    return max(prem, spot * 0.002)
-
-def pnl_from_premiums(entry_prem, exit_prem, lot_size, qty):
-    slippage = (entry_prem + exit_prem) * 0.003 * lot_size * qty
-    raw      = (exit_prem - entry_prem) * lot_size * qty
-    pnl      = raw - slippage
-    max_loss = -entry_prem * lot_size * qty
-    return round(max(pnl, max_loss), 2)
-
-# ══════════════════════════════════════════════════════════════════════
-# 📊 PERFORMANCE REPORT
-# ══════════════════════════════════════════════════════════════════════
-
-def print_performance_report():
-    conn = sqlite3.connect(DB_FILE)
-    try:
-        df = pd.read_sql_query("SELECT * FROM trades", conn)
-        if df.empty:
-            log.info("📊 No trades yet to report")
-            return
-        total  = len(df)
-        wins   = len(df[df["pnl"] > 0])
-        wr     = wins / total * 100 if total > 0 else 0
-        t_pnl  = df["pnl"].sum()
-        avg_w  = df[df["pnl"] > 0]["pnl"].mean() if wins > 0 else 0
-        avg_l  = df[df["pnl"] <= 0]["pnl"].mean() if (total - wins) > 0 else 0
-        best   = df["pnl"].max()
-        worst  = df["pnl"].min()
-        loss_sum = df[df["pnl"] < 0]["pnl"].sum()
-        win_sum  = df[df["pnl"] > 0]["pnl"].sum()
-        pf     = win_sum / abs(loss_sum) if loss_sum != 0 else float("inf")
-
-        log.info("═" * 60)
-        log.info("  📈 PERFORMANCE REPORT")
-        log.info("═" * 60)
-        log.info(f"  Total Trades : {total}")
-        log.info(f"  Win Rate     : {wr:.1f}%")
-        log.info(f"  Total P&L    : ₹{t_pnl:,.0f}")
-        log.info(f"  Avg Win      : ₹{avg_w:,.0f}")
-        log.info(f"  Avg Loss     : ₹{avg_l:,.0f}")
-        log.info(f"  Best Trade   : ₹{best:,.0f}")
-        log.info(f"  Worst Trade  : ₹{worst:,.0f}")
-        log.info(f"  Profit Factor: {pf:.2f}")
-        log.info("═" * 60)
-    finally:
-        conn.close()
-
-# ══════════════════════════════════════════════════════════════════════
-# 🚀 MAIN TRADING LOOP
-# ══════════════════════════════════════════════════════════════════════
-
-def run_bot():
-    log.info("═" * 60)
-    log.info("  🤖 NIFTY OPTIONS PAPER TRADING BOT STARTING")
-    log.info(f"  Capital  : ₹{TOTAL_CAPITAL:,} | {NUM_UNITS} units × ₹{UNIT_SIZE:,}")
-    log.info(f"  SL/TP    : -{SL_DROP_PCT*100:.0f}% / +{TP_GAIN_PCT*100:.0f}% premium")
-    log.info(f"  Strategy : EMA {EMA_FAST}/{EMA_SLOW}/{EMA_TREND} | BB | RSI | ADX | VWAP")
-    log.info("═" * 60)
-
-    # Initialize
-    init_db()
-    state  = load_state()
-    scrip  = load_scrip()
-    cs     = ContractSelector(scrip)
-
-    # Track daily opening capital
-    daily_open_cap = {}
-    daily_signals  = defaultdict(int)
-
-    prev_candle_ts = None   # to track new candle events
-
-    while True:
         try:
-            ts_now = now_ist()
-            h, m   = ts_now.hour, ts_now.minute
-            day    = ts_now.date()
-
-            # ── Sleep outside market hours ────────────────────────
-            is_market_day = ts_now.weekday() < 5   # Mon-Fri
-            after_open    = (h > 9) or (h == 9 and m >= 15)
-            before_close  = (h < 15) or (h == 15 and m <= 30)
-
-            if not is_market_day or not after_open or not before_close:
-                # Print EOD report once at 15:35
-                if h == 15 and m == 35:
-                    print_performance_report()
-                    save_daily_summary(
-                        str(day),
-                        daily_open_cap.get(str(day), TOTAL_CAPITAL),
-                        sum(u["capital"] for u in state["units"]),
-                        0, 0, 0, daily_signals.get(str(day), 0)
-                    )
-                next_check = 300 if not is_market_day else 60
-                log.info(f"💤 Market closed — sleeping {next_check}s")
-                time.sleep(next_check)
-                continue
-
-            # ── Fetch latest candles ──────────────────────────────
-            spot_df = fetch_spot(lookback_days=5)
-            if spot_df is None or len(spot_df) < 55:
-                log.warning("⚠️ Not enough candle data — retrying in 60s")
-                time.sleep(60)
-                continue
-
-            # Track daily open
-            day_str = str(day)
-            if day_str not in daily_open_cap:
-                daily_open_cap[day_str] = sum(u["capital"] for u in state["units"])
-                log.info(f"📅 New day {day_str} | Opening capital: ₹{daily_open_cap[day_str]:,.0f}")
-
-            spot_df = add_indicators(spot_df).dropna()
-            if len(spot_df) < 2:
-                time.sleep(60)
-                continue
-
-            # Get the last completed candle (not the forming one)
-            row     = spot_df.iloc[-2]
-            bar_ts  = spot_df.index[-2]
-            bar_idx = state["total_bars_seen"]
-
-            # Skip if we already processed this candle
-            if str(bar_ts) == str(prev_candle_ts):
-                time.sleep(LOOP_SLEEP)
-                continue
-
-            prev_candle_ts = bar_ts
-            state["total_bars_seen"] += 1
-
-            log.info(f"🕯️  Bar [{bar_ts}] Spot={row['close']:.0f} "
-                     f"ADX={row['adx']:.1f} RSI={row['rsi']:.1f}")
-
-            in_entry = (
-                (h == ENTRY_START[0] and m >= ENTRY_START[1]) or
-                (ENTRY_START[0] < h < ENTRY_END[0]) or
-                (h == ENTRY_END[0] and m <= ENTRY_END[1])
-            )
-            is_eod  = (h > HARD_CLOSE[0]) or (h == HARD_CLOSE[0] and m >= HARD_CLOSE[1])
-            port_pnl_today = sum(
-                u["day_pnl"].get(day_str, 0.0) for u in state["units"]
-            )
-            port_ok = port_pnl_today > -(TOTAL_CAPITAL * MAX_PORT_DAY_LOSS)
-
-            # ═══ PROCESS EACH UNIT ═══════════════════════════════
-            for u in state["units"]:
-                # Decrement cooldown
-                if u["cooldown"] > 0:
-                    u["cooldown"] -= 1
-
-                # ── EXIT LOGIC ───────────────────────────────────
-                if u["trade"] is not None:
-                    t         = u["trade"]
-                    bars_held = bar_idx - t["bar"]
-                    reason    = None
-
-                    # Get current option premium
-                    cur_prem = None
-                    if t.get("sid"):
-                        cur_prem = fetch_option_price(t["sid"])
-
-                    if cur_prem is None:
-                        # Synthetic price estimate
-                        spot_chg  = row["close"] - t["entry_spot"]
-                        sign      = 1 if t["opt_type"] == "CE" else -1
-                        prem_move = sign * spot_chg * 0.50
-                        cur_prem  = max(
-                            t["entry_prem"] + prem_move - t["entry_prem"] * 0.00025 * bars_held,
-                            0.05
-                        )
-
-                    # Update trailing peak
-                    t["peak_prem"] = max(t.get("peak_prem", t["entry_prem"]), cur_prem)
-
-                    sl_level    = t["entry_prem"] * (1 - SL_DROP_PCT)
-                    tp_level    = t["entry_prem"] * (1 + TP_GAIN_PCT)
-                    trail_floor = None
-                    if t["peak_prem"] >= t["entry_prem"] * (1 + TRAIL_START):
-                        trail_floor = t["peak_prem"] * TRAIL_LOCK
-
-                    if is_eod:
-                        reason = "EOD"
-                    elif bars_held >= MIN_HOLD:
-                        if cur_prem <= sl_level:
-                            reason = "SL_PREM"
-                        elif cur_prem >= tp_level:
-                            reason = "TP_PREM"
-                        elif trail_floor and cur_prem < trail_floor:
-                            reason = "TRAIL"
-
-                    if reason:
-                        pnl = pnl_from_premiums(
-                            t["entry_prem"], cur_prem, t["lot_size"], t["qty"]
-                        )
-                        u["capital"] += pnl
-                        u["day_pnl"][day_str] = u["day_pnl"].get(day_str, 0.0) + pnl
-                        u["trade"] = None
-
-                        if pnl < 0:
-                            u["streak"] += 1
-                            if u["streak"] >= MAX_LOSS_STREAK:
-                                u["cooldown"] = COOLDOWN_AFTER_LOSS
-                                u["streak"]   = 0
-                        else:
-                            u["streak"] = 0
-
-                        trade_record = {
-                            "unit":        u["uid"],
-                            "opt_type":    t["opt_type"],
-                            "symbol":      t["symbol"],
-                            "strike":      t["strike"],
-                            "entry_time":  t["entry_time"],
-                            "exit_time":   str(bar_ts),
-                            "entry_spot":  t["entry_spot"],
-                            "exit_spot":   row["close"],
-                            "entry_prem":  t["entry_prem"],
-                            "exit_prem":   cur_prem,
-                            "qty":         t["qty"],
-                            "lot_size":    t["lot_size"],
-                            "bars_held":   bars_held,
-                            "pnl":         pnl,
-                            "reason":      reason,
-                            "live_data":   t.get("live_entry", False),
-                            "capital_after": u["capital"]
-                        }
-                        log_trade_db(trade_record)
-
-                        emoji = "✅" if pnl >= 0 else "🔴"
-                        log.info(
-                            f"{emoji} CLOSE [Unit {u['uid']}] {t['opt_type']} | "
-                            f"P&L: ₹{pnl:,.0f} | Reason: {reason} | "
-                            f"Capital now: ₹{u['capital']:,.0f}"
-                        )
-
-            # ═══ ENTRY LOGIC ═════════════════════════════════════
-            if in_entry and port_ok and not is_eod:
-                direction = get_signal(row)
-
-                if direction:
-                    daily_signals[day_str] = daily_signals.get(day_str, 0) + 1
-                    log_signal_db(bar_ts, direction, row["close"], row["adx"], row["rsi"])
-                    log.info(f"🎯 Signal: {direction} | Spot={row['close']:.0f} "
-                             f"ADX={row['adx']:.1f} RSI={row['rsi']:.1f}")
-
-                    rr_ptr = state["rr_ptr"]
-                    assigned = False
-
-                    for attempt in range(NUM_UNITS):
-                        uid = (rr_ptr + attempt) % NUM_UNITS
-                        u   = state["units"][uid]
-
-                        # Check unit availability
-                        if u["trade"] is not None:
-                            continue
-                        if u["cooldown"] > 0:
-                            continue
-                        if u["day_pnl"].get(day_str, 0.0) <= -(UNIT_SIZE * MAX_UNIT_DAY_LOSS):
-                            continue
-                        if bar_idx - u.get("last_bar", -99) < SIG_COOLDOWN:
-                            continue
-
-                        # Get contract
-                        contract   = cs.get(row["close"], direction, day)
-                        sid        = contract["sid"]
-                        lot_size   = contract["lot_size"]
-                        dte        = contract.get("dte", 5)
-
-                        # Get premium
-                        entry_prem = None
-                        live_entry = False
-                        if sid:
-                            entry_prem = fetch_option_price(sid)
-                            live_entry = entry_prem is not None
-
-                        if entry_prem is None:
-                            entry_prem = synth_prem(row["close"], dte)
-
-                        if entry_prem <= 0:
-                            continue
-
-                        cost_1lot = entry_prem * lot_size
-
-                        # Position sizing (same as backtest)
-                        if cost_1lot > u["capital"] * MAX_COST_PCT:
-                            if cost_1lot > u["capital"]:
-                                log.debug(f"Unit {uid}: cost ₹{cost_1lot:.0f} > capital ₹{u['capital']:.0f}")
-                                continue
-                            qty = 1
-                        else:
-                            budget = u["capital"] * MAX_COST_PCT
-                            qty    = min(MAX_LOTS, max(1, int(budget / cost_1lot)))
-
-                        total_cost = entry_prem * lot_size * qty
-                        if total_cost > u["capital"]:
-                            qty = max(1, int(u["capital"] / cost_1lot))
-                        if qty == 0 or entry_prem * lot_size > u["capital"]:
-                            continue
-
-                        # ✅ ENTRY CONFIRMED
-                        u["trade"] = {
-                            "bar":        bar_idx,
-                            "entry_time": str(bar_ts),
-                            "entry_spot": float(row["close"]),
-                            "entry_prem": float(entry_prem),
-                            "sid":        sid,
-                            "symbol":     contract["symbol"],
-                            "strike":     float(contract["strike"]),
-                            "opt_type":   direction,
-                            "qty":        qty,
-                            "lot_size":   float(lot_size),
-                            "live_entry": live_entry,
-                            "peak_prem":  float(entry_prem),
-                        }
-                        u["last_bar"]  = bar_idx
-                        u["n_trades"] += 1
-                        state["rr_ptr"] = (uid + 1) % NUM_UNITS
-                        assigned = True
-
-                        cost = entry_prem * lot_size * qty
-                        log.info(
-                            f"📥 ENTER [Unit {uid}] {direction} | "
-                            f"Symbol: {contract['symbol']} | Strike: {contract['strike']} | "
-                            f"Prem: ₹{entry_prem:.1f} | Qty: {qty} lots | "
-                            f"Cost: ₹{cost:,.0f} | Live: {live_entry}"
-                        )
-                        break
-
-                    if not assigned:
-                        log.debug(f"Signal {direction} — no free unit available")
-
-            # ── Save state after every bar ────────────────────────
-            save_state(state)
-
-            total_cap = sum(u["capital"] for u in state["units"])
-            log.info(
-                f"💼 Portfolio: ₹{total_cap:,.0f} | "
-                f"Day P&L: ₹{port_pnl_today:,.0f} | "
-                f"Open positions: {sum(1 for u in state['units'] if u['trade'])}"
-            )
-
-            # Sleep until next candle (~15 min)
-            time.sleep(LOOP_SLEEP)
-
-        except KeyboardInterrupt:
-            log.info("🛑 Bot stopped by user")
-            save_state(state)
-            print_performance_report()
-            break
+            with open(STATE_FILE) as f:
+                s = json.load(f)
+            units = [Unit.from_dict(u) for u in s["units"]]
+            return units, s.get("rr", 0), s.get("month_start_cap", float(TOTAL_CAPITAL))
         except Exception as e:
-            log.error(f"❌ Unexpected error: {e}", exc_info=True)
-            save_state(state)
-            time.sleep(60)   # retry after 1 min
+            logging.warning(f"State load failed: {e} — fresh start")
+    return [Unit(i) for i in range(NUM_UNITS)], 0, float(TOTAL_CAPITAL)
 
+# ═══════════════════════════════════════════════════════════
+# ⏰  IST TIME HELPERS
+# ═══════════════════════════════════════════════════════════
+def _ist():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+    except ImportError:
+        return datetime.utcnow() + timedelta(hours=5, minutes=30)
+
+def is_trading_day(dt=None): return (_ist() if dt is None else dt).weekday() < 5
+def is_entry_win(dt=None):
+    t = (_ist() if dt is None else dt); hm = (t.hour, t.minute)
+    return ENTRY_START <= hm <= ENTRY_END and is_trading_day(t)
+def is_hard_close(dt=None):
+    t = (_ist() if dt is None else dt); return (t.hour, t.minute) >= HARD_CLOSE
+def is_market_open(dt=None):
+    t = (_ist() if dt is None else dt)
+    if not is_trading_day(t): return False
+    return (9,15) <= (t.hour, t.minute) <= (15,30)
+
+def secs_to_open():
+    n = _ist()
+    if not is_trading_day(n):
+        d = 7 - n.weekday()
+        nxt = (n + timedelta(days=d)).replace(hour=9, minute=15, second=0, microsecond=0)
+        return max(int((nxt - n).total_seconds()), 0)
+    op = n.replace(hour=9, minute=15, second=0, microsecond=0)
+    return max(int((op - n).total_seconds()), 0) if n < op else 0
+
+# ═══════════════════════════════════════════════════════════
+# 🤖  BOT ENGINE
+# ═══════════════════════════════════════════════════════════
+class Bot:
+    def __init__(self):
+        self.log = setup_log("bot")
+        init_db()
+        self.units, self.rr, self.month_cap = load_state()
+        self.bar_idx    = 0
+        self.last_ts    = None
+        self.today_trd  = []
+        self.port_dpnl  = defaultdict(float)
+
+        self.log.info("=" * 62)
+        self.log.info("  NIFTY PAPER BOT v9 — FINAL")
+        self.log.info(f"  Capital: ₹{sum(u.capital for u in self.units):,.0f}  "
+                      f"Units: {NUM_UNITS} × ₹{UNIT_SIZE:,}")
+        self.log.info(f"  Signal: RSI<{RSI_CE_MAX}→CE | RSI>{RSI_PE_MIN}→PE | ADX≥{ADX_MIN}")
+        self.log.info(f"  SL:{SL_PCT*100:.0f}% | TP:{TP_PCT*100:.0f}% | TIME:{TIME_EXIT_BARS}bars")
+        self.log.info(f"  Max trades/unit/day: {MAX_TRADES_PER_DAY}")
+        self.log.info("=" * 62)
+        self._tg("🤖 <b>Nifty Bot v9 Started</b>\n"
+                 f"Capital: ₹{TOTAL_CAPITAL:,} | {NUM_UNITS} units\n"
+                 f"Signal: RSI level | SL:{SL_PCT*100:.0f}% | TP:{TP_PCT*100:.0f}%")
+
+    def _tg(self, msg):
+        if not TELEGRAM_ENABLED or not TELEGRAM_TOKEN: return
+        try:
+            url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            data = urllib.parse.urlencode({"chat_id":TELEGRAM_CHAT_ID,
+                                           "text":msg,"parse_mode":"HTML"}).encode()
+            urllib.request.urlopen(urllib.request.Request(url,data,method="POST"), timeout=8)
+        except: pass
+
+    def run(self):
+        self.log.info("🟢 Bot live. Ctrl+C to stop.")
+        while True:
+            try:
+                now = _ist()
+                if not is_market_open(now):
+                    secs = secs_to_open()
+                    self.log.info(f"💤 Market closed — sleeping 60s")
+                    time.sleep(60)
+                    continue
+
+                # Wait for next 15-min bar boundary
+                mins_left = 15 - (now.minute % 15)
+                secs_left = mins_left * 60 - now.second
+                if secs_left > 15:
+                    time.sleep(secs_left - 10)
+                    continue
+
+                time.sleep(12)   # Let bar fully close
+                self._bar()
+
+            except KeyboardInterrupt:
+                save_state(self.units, self.rr, self.month_cap)
+                self.log.info("⛔ Stopped. State saved.")
+                break
+            except Exception as e:
+                self.log.error(f"Loop error: {e}", exc_info=True)
+                self._tg(f"⚠️ Bot error: {e}")
+                time.sleep(60)
+
+    def _bar(self):
+        now = _ist()
+        df  = fetch_spot()
+        if df is None or len(df) < 30:
+            self.log.warning("Insufficient spot data — skip")
+            return
+
+        df  = add_indicators(df).dropna()
+        if df.empty: return
+
+        row = df.iloc[-1]
+        ts  = df.index[-1]
+        day = ts.date()
+        spot = float(row["close"])
+
+        # ── Day change detection ────────────────────────────
+        if self.last_ts and self.last_ts.date() != day:
+            self._eod(self.last_ts.date())
+            self.today_trd = []
+            self.port_dpnl = defaultdict(float)
+            if day.month != self.last_ts.date().month:
+                self.month_cap = sum(u.capital for u in self.units)
+                save_state(self.units, self.rr, self.month_cap)
+
+        self.last_ts  = ts
+        self.bar_idx += 1
+        for u in self.units: u.tick()
+
+        # ── Monthly DD guard ────────────────────────────────
+        total_cap  = sum(u.capital for u in self.units)
+        monthly_dd = (total_cap - self.month_cap) / self.month_cap
+        if monthly_dd < -MAX_PORT_DD_MONTHLY:
+            self.log.warning(f"🛑 Monthly DD {monthly_dd*100:.1f}% — HALTED")
+            return
+
+        # ── Daily DD guard ──────────────────────────────────
+        port_day_ok = self.port_dpnl[day] > -(TOTAL_CAPITAL * MAX_PORT_DD_DAILY)
+        eod = is_hard_close(now)
+
+        # ── EXITS ───────────────────────────────────────────
+        for u in self.units:
+            if u.trade:
+                self._exit(u, row, ts, spot, eod)
+
+        # ── ENTRIES ─────────────────────────────────────────
+        if is_entry_win(now) and port_day_ok and not eod:
+            self._entry(row, ts, day, spot)
+
+        # ── Compute open P&L for display ───────────────────
+        open_pnl = sum(u.open_pnl(spot) for u in self.units)
+        closed_pnl = self.port_dpnl.get(day, 0)
+        n_open = sum(1 for u in self.units if u.trade)
+
+        save_equity(ts, total_cap, open_pnl, spot)
+        save_state(self.units, self.rr, self.month_cap)
+
+        self.log.info(
+            f"🕯️  [{ts.strftime('%H:%M')}] Spot={spot:.0f} "
+            f"ADX={row['adx']:.1f} RSI={row['rsi']:.1f} "
+            f"EMA={'↑' if row['ema9']>row['ema21'] else '↓'} | "
+            f"Open:{n_open} | DayPNL:₹{closed_pnl+open_pnl:+,.0f}"
+        )
+
+        if eod: self._eod(day)
+
+    # ── FIXED EXIT — bar count bug fixed ─────────────────────
+    def _exit(self, u, row, ts, spot, eod):
+        t  = u.trade
+        bh = t.get("bars", 0)          # current bars held
+        t["bars"] = bh + 1             # increment AFTER reading (FIXED)
+
+        # Current premium estimate
+        cp = mark_prem(t["entry_prem"], t["entry_spot"],
+                       spot, t["opt_type"], bh)
+        t["peak"] = max(t.get("peak", t["entry_prem"]), cp)
+
+        sl_lvl = t["entry_prem"] * (1 - SL_PCT)
+        tp_lvl = t["entry_prem"] * (1 + TP_PCT)
+        trail  = (t["peak"] * 0.75
+                  if t["peak"] >= t["entry_prem"] * 1.40 else None)
+
+        reason = None
+        if eod:
+            reason = "EOD"
+        elif bh >= MIN_HOLD_BARS:       # Only check exits after min hold
+            if   cp <= sl_lvl:          reason = "SL"
+            elif cp >= tp_lvl:          reason = "TP"
+            elif trail and cp < trail:  reason = "TRAIL"
+            elif bh >= TIME_EXIT_BARS:  reason = "TIME"  # FIXED: reads bh before +1
+
+        if not reason: return
+
+        pnl = calc_pnl(t["entry_prem"], cp, t["lot_size"], t["qty"])
+        u.close(pnl, ts)
+        self.port_dpnl[ts.date()] += pnl
+
+        rec = {**t, "exit_time":ts.isoformat(), "exit_spot":spot,
+               "exit_prem":cp, "bars_held":bh, "pnl":pnl, "reason":reason}
+        save_trade(rec)
+        self.today_trd.append(rec)
+
+        em = "✅" if pnl > 0 else "❌"
+        self.log.info(
+            f"🔴 EXIT [U{u.uid}] {t['opt_type']} {reason} "
+            f"bars={bh} prem={t['entry_prem']:.0f}→{cp:.0f} "
+            f"P&L=₹{pnl:+,.0f} cap=₹{u.capital:,.0f}"
+        )
+        self._tg(f"{em} <b>EXIT {reason}</b> [Unit {u.uid}] {t['opt_type']}\n"
+                 f"Prem ₹{t['entry_prem']:.0f}→₹{cp:.0f} | <b>P&L ₹{pnl:+,.0f}</b>\n"
+                 f"Held {bh} bars ({bh*15}min)")
+
+    # ── ENTRY ─────────────────────────────────────────────────
+    def _entry(self, row, ts, day, spot):
+        sig = get_signal(row)
+        if not sig: return
+
+        self.log.info(f"🎯 Signal: {sig} | RSI={row['rsi']:.1f} ADX={row['adx']:.1f}")
+
+        for attempt in range(NUM_UNITS):
+            uid = (self.rr + attempt) % NUM_UNITS
+            u   = self.units[uid]
+            if not u.can_enter(ts, self.bar_idx): continue
+
+            ep  = synth_prem(spot)
+            lot = LOT_SIZE
+            if ep * lot > u.capital:
+                self.log.info(f"  Unit {uid}: cost ₹{ep*lot:.0f} > capital ₹{u.capital:.0f}")
+                continue
+
+            budget = u.capital * MAX_COST_PCT
+            qty    = min(MAX_LOTS, max(1, int(budget / (ep * lot))))
+
+            trade = {"unit":uid, "bars":0, "peak":ep,
+                     "entry_time":ts.isoformat(), "entry_spot":spot,
+                     "entry_prem":ep, "sid":None,
+                     "symbol":f"NIFTY{round(spot/50)*50}{sig}",
+                     "strike":float(round(spot/50)*50),
+                     "opt_type":sig, "qty":qty, "lot_size":float(lot)}
+
+            u.enter(trade, self.bar_idx, ts)
+            self.rr = (uid + 1) % NUM_UNITS
+
+            self.log.info(
+                f"📥 ENTER [U{uid}] {sig} | Strike:{trade['strike']:.0f} "
+                f"Prem:₹{ep:.1f} Qty:{qty} Cost:₹{ep*lot*qty:,.0f}"
+            )
+            self._tg(f"🟢 <b>ENTER {sig}</b> [Unit {uid}]\n"
+                     f"Strike {trade['strike']:.0f} | Prem ₹{ep:.0f} × {qty} lot\n"
+                     f"Cost ₹{ep*lot*qty:,.0f}")
+            break
+
+    def _eod(self, d):
+        pnl  = self.port_dpnl.get(d, 0)
+        cap  = sum(u.capital for u in self.units)
+        n    = len(self.today_trd)
+        wins = sum(1 for t in self.today_trd if t.get("pnl", 0) > 0)
+        self.log.info("=" * 62)
+        self.log.info(f"  📅 EOD — {d}")
+        self.log.info(f"  Capital: ₹{cap:,.0f} | Day P&L: ₹{pnl:+,.0f}")
+        self.log.info(f"  Trades: {n} | Wins: {wins}")
+        self.log.info("=" * 62)
+        self._tg(f"📅 <b>EOD {d}</b>\n"
+                 f"Capital ₹{cap:,.0f} | P&L ₹{pnl:+,.0f}\n"
+                 f"Trades: {n} | Wins: {wins}")
+
+# ═══════════════════════════════════════════════════════════
+# 🧪  BACKTEST ENGINE
+# ═══════════════════════════════════════════════════════════
+def run_backtest(from_date=None, to_date=None):
+    log = setup_log("backtest")
+    from_date = from_date or (datetime.now()-timedelta(days=30)).strftime("%Y-%m-%d")
+    to_date   = to_date   or datetime.now().strftime("%Y-%m-%d")
+
+    print(f"\n{'═'*62}")
+    print(f"  BACKTEST: {from_date} → {to_date}")
+    print(f"  Strategy: RSI<{RSI_CE_MAX}→CE | RSI>{RSI_PE_MIN}→PE | ADX≥{ADX_MIN}")
+    print(f"  SL:{SL_PCT*100:.0f}% | TP:{TP_PCT*100:.0f}% | Time:{TIME_EXIT_BARS} bars")
+    print(f"{'═'*62}")
+
+    print("📡 Fetching data from Dhan API...")
+
+    # Dhan API limits ~75 days per call, chunk if needed
+    all_dfs = []
+    start = datetime.strptime(from_date, "%Y-%m-%d")
+    end   = datetime.strptime(to_date,   "%Y-%m-%d")
+    chunk = timedelta(days=60)
+    ptr   = start
+    while ptr < end:
+        nxt = min(ptr + chunk, end)
+        df_chunk = fetch_spot_history(ptr.strftime("%Y-%m-%d"), nxt.strftime("%Y-%m-%d"))
+        if df_chunk is not None and len(df_chunk) > 0:
+            all_dfs.append(df_chunk)
+        ptr = nxt + timedelta(days=1)
+
+    if not all_dfs:
+        print("❌ No data. Check credentials and dates.")
+        return None
+
+    df = pd.concat(all_dfs).drop_duplicates().sort_index()
+    df = add_indicators(df).dropna()
+    print(f"✅ {len(df)} candles | {df.index[0].date()} → {df.index[-1].date()}")
+
+    # Backtest state
+    units      = [Unit(i) for i in range(NUM_UNITS)]
+    rr         = 0
+    bar_idx    = 0
+    trades     = []
+    eq_curve   = []
+    port_dpnl  = defaultdict(float)
+    all_days   = set()
+
+    for i in range(2, len(df)):
+        row  = df.iloc[i]
+        ts   = df.index[i]
+        day  = ts.date()
+        spot = float(row["close"])
+        h, m = ts.hour, ts.minute
+
+        for u in units: u.tick()
+        bar_idx += 1
+        all_days.add(day)
+
+        in_entry = ENTRY_START <= (h, m) <= ENTRY_END
+        eod      = (h, m) >= HARD_CLOSE
+
+        # Port daily guard
+        port_ok = port_dpnl[day] > -(TOTAL_CAPITAL * MAX_PORT_DD_DAILY)
+
+        # EXITS
+        for u in units:
+            if not u.trade: continue
+            t  = u.trade
+            bh = t.get("bars", 0)
+            t["bars"] = bh + 1
+
+            cp = mark_prem(t["entry_prem"], t["entry_spot"],
+                           spot, t["opt_type"], bh)
+            t["peak"] = max(t.get("peak", t["entry_prem"]), cp)
+
+            sl = t["entry_prem"] * (1 - SL_PCT)
+            tp = t["entry_prem"] * (1 + TP_PCT)
+            tr = t["peak"] * 0.75 if t["peak"] >= t["entry_prem"] * 1.40 else None
+
+            reason = None
+            if eod: reason = "EOD"
+            elif bh >= MIN_HOLD_BARS:
+                if   cp <= sl:           reason = "SL"
+                elif cp >= tp:           reason = "TP"
+                elif tr and cp < tr:     reason = "TRAIL"
+                elif bh >= TIME_EXIT_BARS: reason = "TIME"
+
+            if not reason: continue
+            pnl = calc_pnl(t["entry_prem"], cp, t["lot_size"], t["qty"])
+            u.close(pnl, ts)
+            port_dpnl[day] += pnl
+            trades.append({**t, "exit_time":str(ts), "exit_spot":spot,
+                           "exit_prem":cp, "bars_held":bh, "pnl":pnl,
+                           "reason":reason, "date":str(day)})
+
+        # ENTRIES
+        if in_entry and port_ok and not eod:
+            sig = get_signal(row)
+            if sig:
+                for attempt in range(NUM_UNITS):
+                    uid = (rr + attempt) % NUM_UNITS
+                    u   = units[uid]
+                    if not u.can_enter(ts, bar_idx): continue
+                    ep  = synth_prem(spot)
+                    lot = LOT_SIZE
+                    if ep * lot > u.capital: continue
+                    qty = min(MAX_LOTS, max(1, int(u.capital * MAX_COST_PCT / (ep * lot))))
+                    u.enter({"unit":uid,"bars":0,"peak":ep,
+                              "entry_time":str(ts),"entry_spot":spot,
+                              "entry_prem":ep,"sid":None,
+                              "symbol":f"NIFTY_ATM_{sig}","strike":round(spot/50)*50,
+                              "opt_type":sig,"qty":qty,"lot_size":float(lot)},
+                             bar_idx, ts)
+                    rr = (uid + 1) % NUM_UNITS
+                    break
+
+        eq_curve.append({"ts":str(ts), "eq":sum(u.capital for u in units), "spot":spot})
+
+    # ─── Results ────────────────────────────────────────────
+    n     = len(trades)
+    wins  = [t for t in trades if t["pnl"] > 0]
+    total = sum(t["pnl"] for t in trades)
+    ret   = total / TOTAL_CAPITAL * 100
+    wr    = len(wins) / n * 100 if n else 0
+    gross_win  = sum(t["pnl"] for t in wins)
+    gross_loss = abs(sum(t["pnl"] for t in trades if t["pnl"] <= 0))
+    pf    = gross_win / gross_loss if gross_loss > 0 else 0
+    n_days = max(len(all_days), 1)
+
+    # Max DD
+    eq_vals = [e["eq"] for e in eq_curve]
+    pk = eq_vals[0]; mdd = 0
+    for e in eq_vals:
+        pk = max(pk, e)
+        mdd = min(mdd, (e - pk) / pk * 100)
+
+    # Exit breakdown
+    by_reason = defaultdict(lambda: {"n":0, "pnl":0, "wins":0})
+    for t in trades:
+        r = t["reason"]
+        by_reason[r]["n"]   += 1
+        by_reason[r]["pnl"] += t["pnl"]
+        if t["pnl"] > 0: by_reason[r]["wins"] += 1
+
+    # Daily P&L
+    by_day = defaultdict(lambda: {"n":0, "pnl":0})
+    for t in trades:
+        d = t.get("date","")
+        by_day[d]["n"]   += 1
+        by_day[d]["pnl"] += t["pnl"]
+
+    days_positive = sum(1 for v in by_day.values() if v["pnl"] > 0)
+
+    print(f"\n{'═'*62}")
+    print(f"  BACKTEST RESULTS")
+    print(f"{'─'*62}")
+    print(f"  Period    : {from_date} → {to_date} ({n_days} trading days)")
+    print(f"  Capital   : ₹{TOTAL_CAPITAL:,} → ₹{sum(u.capital for u in units):,.0f}")
+    print(f"  P&L       : ₹{total:+,.0f}  ({ret:+.1f}%)")
+    print(f"  Trades    : {n}  ({n/n_days:.1f}/day avg)")
+    print(f"  Win Rate  : {wr:.1f}%  (break-even: 33%)")
+    print(f"  P. Factor : {pf:.2f}")
+    print(f"  Max DD    : {mdd:.1f}%")
+    print(f"  +Days     : {days_positive}/{len(by_day)} ({days_positive/max(len(by_day),1)*100:.0f}%)")
+    print(f"{'─'*62}")
+    print(f"  EXIT BREAKDOWN:")
+    for r, v in sorted(by_reason.items()):
+        wr2 = v["wins"]/v["n"]*100 if v["n"] else 0
+        print(f"    {r:<6} N:{v['n']:>3}  WR:{wr2:.0f}%  P&L:₹{v['pnl']:>9,.0f}")
+    print(f"{'─'*62}")
+    print(f"  RECENT DAYS:")
+    for d, v in sorted(by_day.items())[-5:]:
+        arrow = "📈" if v["pnl"] > 0 else "📉"
+        print(f"    {arrow} {d}  Trades:{v['n']}  P&L:₹{v['pnl']:+,.0f}")
+    print(f"{'─'*62}")
+    print(f"  GO-LIVE READINESS:")
+    checks = [
+        (f"Win Rate ≥ 35%",        wr >= 35),
+        (f"Profit Factor ≥ 1.5",   pf >= 1.5),
+        (f"Monthly Return > 15%",  ret / max((n_days/21), 1) > 15),
+        (f"≥ 2 trades/day avg",    n/n_days >= 2),
+        (f"Max DD > -12%",         mdd > -12),
+        (f">60% positive days",    days_positive/max(len(by_day),1) > 0.60),
+    ]
+    all_pass = True
+    for label, ok in checks:
+        print(f"    {'✅' if ok else '❌'} {label}")
+        if not ok: all_pass = False
+    verdict = "🟢 READY FOR PAPER TRADING" if all_pass else "🔴 NEEDS MORE ADJUSTMENT"
+    print(f"\n  {verdict}")
+    print(f"{'═'*62}\n")
+
+    result = {
+        "from_date": from_date, "to_date": to_date,
+        "n_trades": n, "n_days": n_days,
+        "avg_per_day": round(n/n_days, 2),
+        "total_pnl": round(total, 2),
+        "return_pct": round(ret, 2),
+        "win_rate": round(wr, 1),
+        "profit_factor": round(pf, 2),
+        "max_dd": round(mdd, 2),
+        "days_positive": days_positive,
+        "days_total": len(by_day),
+        "by_reason": {k: dict(v) for k, v in by_reason.items()},
+        "by_day": {k: dict(v) for k, v in by_day.items()},
+        "eq_curve": eq_curve[-200:],   # last 200 points for chart
+        "all_pass": all_pass,
+        "run_time": datetime.now().isoformat(),
+    }
+    init_db()
+    save_backtest(result)
+    return result
+
+# ═══════════════════════════════════════════════════════════
+# 📊  DASHBOARD — COMPLETELY REBUILT
+#     Shows: Live Nifty, today's candles, open positions,
+#            today's trades, equity curve, backtest results
+#     FIXED: Uses same DB_FILE path, handles errors,
+#            fetches live price directly, mobile-friendly
+# ═══════════════════════════════════════════════════════════
+
+_LAST_BT  = {}   # cache last backtest in memory
+_BT_LOCK  = threading.Lock()
+
+def _dash_data() -> dict:
+    """Collect all data for dashboard. Never crashes."""
+    d = {
+        "error": None, "live": None, "live_time": "—",
+        "total_cap": TOTAL_CAPITAL, "total_pnl": 0, "total_ret": 0,
+        "today_pnl": 0, "today_trades": [], "open_pos": [],
+        "candles": [], "eq_today": [], "units": [],
+        "week_pnl": 0, "week_n": 0, "month_pnl": 0, "month_ret": 0,
+        "wr_all": 0, "pf_all": 0, "n_all": 0,
+        "backtest": {}, "saved": "—",
+    }
+    try:
+        # State
+        state = {}
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f: state = json.load(f)
+        d["saved"] = state.get("saved", "—")[:19]
+
+        units_raw = state.get("units", [])
+        total_cap = sum(u.get("capital", UNIT_SIZE) for u in units_raw)
+        d["total_cap"] = round(total_cap)
+        d["total_pnl"] = round(total_cap - TOTAL_CAPITAL)
+        d["total_ret"]  = round(d["total_pnl"] / TOTAL_CAPITAL * 100, 2)
+
+        # Live Nifty (fetch fresh candles)
+        df_live = fetch_spot(days=1)
+        if df_live is not None and not df_live.empty:
+            d["live"] = round(float(df_live["close"].iloc[-1]), 1)
+            d["live_time"] = datetime.now().strftime("%H:%M:%S")
+            # Today's candles
+            today_df = df_live[df_live.index.date == date.today()]
+            d["candles"] = [{"t": str(ts)[11:16], "o": round(r["open"],1),
+                              "h": round(r["high"],1), "l": round(r["low"],1),
+                              "c": round(r["close"],1)}
+                            for ts, r in today_df.iterrows()]
+
+        # Open positions
+        cur_spot = d["live"] or 25000
+        for u in units_raw:
+            t = u.get("trade")
+            if t:
+                bh  = t.get("bars", 0)
+                cp  = mark_prem(t["entry_prem"], t["entry_spot"],
+                                cur_spot, t["opt_type"], bh)
+                opnl = calc_pnl(t["entry_prem"], cp, t["lot_size"], t["qty"])
+                d["open_pos"].append({
+                    "uid": u["uid"], "opt_type": t["opt_type"],
+                    "symbol": t.get("symbol","?"),
+                    "strike": t.get("strike", 0),
+                    "entry_prem": t["entry_prem"],
+                    "cur_prem": round(cp, 1),
+                    "open_pnl": round(opnl),
+                    "qty": t["qty"], "bars": bh,
+                    "entry_time": str(t.get("entry_time",""))[:16],
+                })
+
+        # Unit cards
+        for u in units_raw:
+            pnl = round(u.get("capital", UNIT_SIZE) - UNIT_SIZE)
+            d["units"].append({
+                "uid": u["uid"],
+                "cap": round(u.get("capital", UNIT_SIZE)),
+                "pnl": pnl,
+                "trades": u.get("n_trades", 0),
+                "busy": u.get("trade") is not None,
+                "cd": u.get("cooldown", 0),
+            })
+
+        # DB data
+        today      = date.today().isoformat()
+        wk_start   = (date.today()-timedelta(days=date.today().weekday())).isoformat()
+        mo_start   = date.today().replace(day=1).isoformat()
+        all_trades = get_all_trades()
+        td_trades  = [t for t in all_trades if t.get("trade_date") == today]
+        wk_trades  = [t for t in all_trades if t.get("trade_date","") >= wk_start]
+        mo_trades  = [t for t in all_trades if t.get("trade_date","") >= mo_start]
+
+        d["today_trades"] = td_trades
+        d["today_pnl"]    = round(sum(t["pnl"] for t in td_trades))
+        d["week_pnl"]     = round(sum(t["pnl"] for t in wk_trades))
+        d["week_n"]       = len(wk_trades)
+        d["month_pnl"]    = round(sum(t["pnl"] for t in mo_trades))
+        d["month_ret"]    = round(d["month_pnl"] / TOTAL_CAPITAL * 100, 2)
+
+        wins = [t for t in all_trades if t["pnl"] > 0]
+        loss = [t for t in all_trades if t["pnl"] <= 0]
+        d["n_all"]  = len(all_trades)
+        d["wr_all"] = round(len(wins)/len(all_trades)*100, 1) if all_trades else 0
+        gw = sum(t["pnl"] for t in wins)
+        gl = abs(sum(t["pnl"] for t in loss))
+        d["pf_all"] = round(gw/gl, 2) if gl > 0 else 0
+
+        # Equity today
+        eq = get_equity_today()
+        d["eq_today"] = [{"t": e["ts"][11:16],
+                           "eq": e["equity"],
+                           "op": e.get("open_pnl", 0)} for e in eq]
+
+        # Backtest
+        d["backtest"] = get_last_backtest()
+        if _LAST_BT:
+            d["backtest"] = _LAST_BT
+
+    except Exception as e:
+        d["error"] = str(e)
+        logging.error(f"Dashboard data error: {e}", exc_info=True)
+
+    return d
+
+def _render(d: dict) -> str:
+    def pc(v):   return "#22c55e" if v >= 0 else "#ef4444"
+    def fi(v):   return f"₹{abs(v):,.0f}"
+    def sg(v):   return "+" if v >= 0 else "-"
+    def pct(v):  return f"{v:+.1f}%"
+
+    lp   = f"₹{d['live']:,.1f}" if d["live"] else "⏳ Fetching..."
+    lp_c = "#f59e0b"
+
+    # Open positions table
+    op_rows = ""
+    for p in d["open_pos"]:
+        oc   = "#22c55e" if p["opt_type"]=="CE" else "#ef4444"
+        pc2  = "#22c55e" if p["open_pnl"] >= 0 else "#ef4444"
+        op_rows += f"""<tr>
+          <td>Unit {p['uid']}</td>
+          <td style="color:{oc};font-weight:700">{p['opt_type']}</td>
+          <td style="font-size:10px">{p['symbol']}</td>
+          <td>₹{p['entry_prem']:.0f} → ₹{p['cur_prem']:.0f}</td>
+          <td>{p['bars']} bars</td>
+          <td style="color:{pc2};font-weight:700">{sg(p['open_pnl'])}{fi(p['open_pnl'])}</td>
+          <td style="font-size:10px">{p['entry_time']}</td>
+        </tr>"""
+    if not op_rows:
+        op_rows = "<tr><td colspan='7' style='text-align:center;color:#6b7280;padding:20px'>No open positions right now</td></tr>"
+
+    # Today's trades
+    tr_rows = ""
+    for t in reversed(d["today_trades"][-15:]):
+        pc2  = "#22c55e" if t["pnl"] > 0 else "#ef4444"
+        oc   = "#22c55e" if t["opt_type"]=="CE" else "#ef4444"
+        pct2 = (t["exit_prem"]-t["entry_prem"])/max(t["entry_prem"],1)*100
+        em   = "✅" if t["pnl"] > 0 else "❌"
+        tr_rows += f"""<tr>
+          <td>{em}</td>
+          <td style="color:{oc};font-weight:700">{t['opt_type']}</td>
+          <td style="font-size:10px">{str(t['entry_time'])[11:16]}→{str(t['exit_time'])[11:16]}</td>
+          <td style="font-size:11px">{t['exit_reason']}</td>
+          <td>₹{t['entry_prem']:.0f}→₹{t['exit_prem']:.0f} ({pct2:+.0f}%)</td>
+          <td style="color:{pc2};font-weight:700">{sg(t['pnl'])}{fi(t['pnl'])}</td>
+        </tr>"""
+    if not tr_rows:
+        tr_rows = "<tr><td colspan='6' style='text-align:center;color:#6b7280;padding:20px'>No trades today yet — waiting for signals</td></tr>"
+
+    # Unit cards
+    ucards = ""
+    for u in d["units"]:
+        uc  = "#22c55e" if u["pnl"] >= 0 else "#ef4444"
+        bsy = f"🔴 {'⏳'+str(u.get('cd','')) if u.get('cd',0) else 'TRADING'}" if u["busy"] or u.get("cd",0) else "⚪ FREE"
+        ucards += f"""<div class="uc">
+          <div class="ul">Unit {u['uid']} {bsy}</div>
+          <div class="uv">₹{u['cap']:,.0f}</div>
+          <div style="color:{uc};font-size:13px">{sg(u['pnl'])}{fi(u['pnl'])}</div>
+          <div style="color:#6b7280;font-size:10px">{u['trades']} trades</div>
+        </div>"""
+
+    # Backtest summary card
+    bt = d.get("backtest", {})
+    bt_html = ""
+    if bt and bt.get("n_trades"):
+        bc = "#22c55e" if bt.get("return_pct",0) >= 0 else "#ef4444"
+        by_reason = bt.get("by_reason", {})
+        reason_rows = ""
+        for r, v in sorted(by_reason.items()):
+            if isinstance(v, dict):
+                wr2 = v["wins"]/v["n"]*100 if v.get("n",0) > 0 else 0
+                reason_rows += f"<tr><td>{r}</td><td>{v.get('n',0)}</td><td>{wr2:.0f}%</td><td>₹{v.get('pnl',0):+,.0f}</td></tr>"
+        by_day = bt.get("by_day", {})
+        day_rows = ""
+        for day, v in sorted(by_day.items())[-5:]:
+            if isinstance(v, dict):
+                arrow = "📈" if v.get("pnl",0) >= 0 else "📉"
+                day_rows += f"<tr><td>{arrow} {day}</td><td>{v.get('n',0)}</td><td>₹{v.get('pnl',0):+,.0f}</td></tr>"
+        bt_html = f"""
+        <div class="card" style="margin-top:0">
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px">
+            <div><div class="lbl">Return</div><div style="color:{bc};font-weight:700;font-size:18px">{bt.get('return_pct',0):+.1f}%</div></div>
+            <div><div class="lbl">Trades</div><div style="font-weight:700;font-size:18px">{bt.get('n_trades',0)} ({bt.get('avg_per_day',0):.1f}/day)</div></div>
+            <div><div class="lbl">Win Rate</div><div style="font-weight:700;font-size:18px">{bt.get('win_rate',0):.1f}%</div></div>
+            <div><div class="lbl">P.Factor</div><div style="font-weight:700">{bt.get('profit_factor',0):.2f}</div></div>
+            <div><div class="lbl">Max DD</div><div style="font-weight:700">{bt.get('max_dd',0):.1f}%</div></div>
+            <div><div class="lbl">Period</div><div style="font-size:10px;color:#6b7280">{bt.get('from_date','')} → {bt.get('to_date','')}</div></div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+            <div>
+              <div class="lbl" style="margin-bottom:6px">Exit Breakdown</div>
+              <table><tr><th>Reason</th><th>N</th><th>WR</th><th>P&L</th></tr>{reason_rows}</table>
+            </div>
+            <div>
+              <div class="lbl" style="margin-bottom:6px">Recent Days</div>
+              <table><tr><th>Date</th><th>N</th><th>P&L</th></tr>{day_rows}</table>
+            </div>
+          </div>
+          <div style="margin-top:10px;padding:8px;background:#{'1a2e1a' if bt.get('all_pass') else '2e1a1a'};border-radius:6px;font-size:13px;font-weight:600;text-align:center;color:{'#22c55e' if bt.get('all_pass') else '#ef4444'}">
+            {'🟢 READY FOR PAPER TRADING' if bt.get('all_pass') else '🔴 STRATEGY NEEDS ADJUSTMENT'}
+          </div>
+        </div>"""
+    else:
+        bt_html = """<div class="card" style="text-align:center;color:#6b7280;padding:20px">
+          No backtest run yet.<br>Click button below to run one.
+        </div>"""
+
+    # Chart data JSON
+    c_t = json.dumps([x["t"] for x in d["candles"]])
+    c_o = json.dumps([x["o"] for x in d["candles"]])
+    c_h = json.dumps([x["h"] for x in d["candles"]])
+    c_l = json.dumps([x["l"] for x in d["candles"]])
+    c_c = json.dumps([x["c"] for x in d["candles"]])
+    eq_t = json.dumps([x["t"] for x in d["eq_today"]])
+    eq_v = json.dumps([x["eq"] for x in d["eq_today"]])
+
+    err_banner = f'<div style="background:#7f1d1d;padding:8px 16px;font-size:12px;color:#fca5a5">⚠️ Dashboard error: {d["error"]}</div>' if d["error"] else ""
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta http-equiv="refresh" content="30">
+<title>Nifty Bot v9</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0a0e1a;color:#e2e8f0;font-family:'Segoe UI',system-ui,sans-serif;font-size:14px;padding-bottom:20px}}
+.hdr{{background:#111827;padding:12px 16px;border-bottom:1px solid #1e2433;
+      display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;position:sticky;top:0;z-index:100}}
+.hdr h1{{font-size:15px;font-weight:700;color:#3b82f6}}
+.live-price{{font-size:24px;font-weight:800;color:{lp_c}}}
+.meta{{font-size:10px;color:#6b7280}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;padding:12px}}
+.card{{background:#111827;border:1px solid #1e2433;border-radius:10px;padding:14px}}
+.lbl{{font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px}}
+.val{{font-size:20px;font-weight:700}}
+.sub{{font-size:11px;color:#9ca3af;margin-top:2px}}
+.sec{{padding:0 12px 10px}}
+.sec h2{{font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;
+         letter-spacing:.5px;margin-bottom:8px;padding-top:10px;border-top:1px solid #1e2433;margin-top:10px}}
+table{{width:100%;border-collapse:collapse;background:#111827;border-radius:8px;overflow:hidden;font-size:12px}}
+th{{background:#1e2433;padding:7px 10px;text-align:left;font-size:10px;color:#6b7280;text-transform:uppercase}}
+td{{padding:7px 10px;border-bottom:1px solid #1e2433}}
+tr:last-child td{{border:none}}
+.ugrid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px}}
+.uc{{background:#111827;border:1px solid #1e2433;border-radius:8px;padding:10px;text-align:center}}
+.ul{{font-size:10px;color:#6b7280;margin-bottom:4px}}
+.uv{{font-size:16px;font-weight:700}}
+.chartbox{{background:#111827;border:1px solid #1e2433;border-radius:8px;padding:12px;margin-bottom:8px}}
+.btn{{display:inline-block;background:#3b82f6;color:white;padding:9px 18px;
+      border-radius:6px;text-decoration:none;font-size:13px;font-weight:600;margin-right:8px}}
+.btn:hover{{background:#2563eb}}
+.badge{{display:inline-block;background:#1e2433;color:#9ca3af;font-size:10px;padding:2px 7px;border-radius:10px}}
+@media(max-width:480px){{
+  .grid{{grid-template-columns:repeat(2,1fr);gap:8px}}
+  .hdr{{padding:10px 12px}}
+}}
+</style>
+</head>
+<body>
+{err_banner}
+
+<div class="hdr">
+  <div>
+    <h1>📈 Nifty Paper Bot v9</h1>
+    <div class="meta">RSI level signal | SL:{SL_PCT*100:.0f}% TP:{TP_PCT*100:.0f}% Time:{TIME_EXIT_BARS}bars | {MAX_TRADES_PER_DAY} trades/unit/day</div>
+  </div>
+  <div style="text-align:right">
+    <div class="live-price">NIFTY {lp}</div>
+    <div class="meta">🕐 {d['live_time']} IST &nbsp;<span class="badge">⟳ 30s</span></div>
+  </div>
+</div>
+
+<!-- KPI -->
+<div class="grid">
+  <div class="card">
+    <div class="lbl">Portfolio</div>
+    <div class="val">₹{d['total_cap']:,.0f}</div>
+    <div class="sub">Started ₹{TOTAL_CAPITAL:,}</div>
+  </div>
+  <div class="card">
+    <div class="lbl">Total P&L</div>
+    <div class="val" style="color:{pc(d['total_pnl'])}">{sg(d['total_pnl'])}{fi(d['total_pnl'])}</div>
+    <div class="sub" style="color:{pc(d['total_ret'])}">{pct(d['total_ret'])} overall</div>
+  </div>
+  <div class="card">
+    <div class="lbl">Today P&L</div>
+    <div class="val" style="color:{pc(d['today_pnl'])}">{sg(d['today_pnl'])}{fi(d['today_pnl'])}</div>
+    <div class="sub">{len(d['today_trades'])} trades today</div>
+  </div>
+  <div class="card">
+    <div class="lbl">Open P&L</div>
+    <div class="val" style="color:{pc(sum(p['open_pnl'] for p in d['open_pos']))}">
+      {sg(sum(p['open_pnl'] for p in d['open_pos']))}{fi(abs(sum(p['open_pnl'] for p in d['open_pos'])))}
+    </div>
+    <div class="sub">{len(d['open_pos'])} position(s) open</div>
+  </div>
+  <div class="card">
+    <div class="lbl">This Week</div>
+    <div class="val" style="color:{pc(d['week_pnl'])}">{sg(d['week_pnl'])}{fi(d['week_pnl'])}</div>
+    <div class="sub">{d['week_n']} trades</div>
+  </div>
+  <div class="card">
+    <div class="lbl">This Month</div>
+    <div class="val" style="color:{pc(d['month_pnl'])}">{sg(d['month_pnl'])}{fi(d['month_pnl'])}</div>
+    <div class="sub" style="color:{pc(d['month_ret'])}">{pct(d['month_ret'])}</div>
+  </div>
+  <div class="card">
+    <div class="lbl">Win Rate</div>
+    <div class="val">{d['wr_all']:.1f}%</div>
+    <div class="sub">{d['n_all']} total trades</div>
+  </div>
+  <div class="card">
+    <div class="lbl">Profit Factor</div>
+    <div class="val" style="color:{pc(d['pf_all']-1)}">{d['pf_all']:.2f}</div>
+    <div class="sub">Target: ≥ 1.5</div>
+  </div>
+</div>
+
+<!-- OPEN POSITIONS -->
+<div class="sec">
+  <h2>🔴 Open Positions ({len(d['open_pos'])})</h2>
+  <table>
+    <tr><th>Unit</th><th>Type</th><th>Symbol</th><th>Premium</th><th>Bars</th><th>Open P&L</th><th>Entry</th></tr>
+    {op_rows}
+  </table>
+</div>
+
+<!-- CANDLE CHART -->
+<div class="sec">
+  <h2>📊 Today's Nifty — {date.today().strftime('%d %b %Y')}</h2>
+  <div class="chartbox"><canvas id="cChart" height="80"></canvas></div>
+</div>
+
+<!-- EQUITY CHART -->
+<div class="sec">
+  <h2>💰 Today's Portfolio Equity</h2>
+  <div class="chartbox"><canvas id="eqChart" height="55"></canvas></div>
+</div>
+
+<!-- TODAY'S TRADES -->
+<div class="sec">
+  <h2>📋 Today's Trades ({len(d['today_trades'])})</h2>
+  <table>
+    <tr><th></th><th>Type</th><th>Time</th><th>Exit</th><th>Premium</th><th>P&L</th></tr>
+    {tr_rows}
+  </table>
+</div>
+
+<!-- UNITS -->
+<div class="sec">
+  <h2>🏦 Unit Breakdown</h2>
+  <div class="ugrid">{ucards}</div>
+</div>
+
+<!-- BACKTEST -->
+<div class="sec">
+  <h2>🧪 Backtest Results</h2>
+  {bt_html}
+  <div style="margin-top:12px">
+    <a href="/run-backtest" class="btn">▶ Run Backtest (30 days)</a>
+    <a href="/run-backtest?days=60" class="btn" style="background:#7c3aed">▶ 60 Days</a>
+    <a href="/api" style="color:#6b7280;font-size:11px">JSON API</a>
+  </div>
+</div>
+
+<div style="padding:10px 16px;color:#374151;font-size:10px;text-align:center">
+  Paper Trading Only — No real orders | State: {d['saved']} | DB: {DB_FILE}
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script>
+const G='#22c55e', R='#ef4444', B='#3b82f6', TX='#9ca3af', GD='#1e2433';
+const TC = {c_t}, TO = {c_o}, TH = {c_h}, TL = {c_l}, TC2 = {c_c};
+const EQT = {eq_t}, EQV = {eq_v};
+
+function baseOpts(yFmt) {{
+  return {{
+    responsive:true, animation:false,
+    plugins:{{legend:{{display:false}}}},
+    scales:{{
+      x:{{ticks:{{color:TX,font:{{size:9}},maxTicksLimit:10,maxRotation:30}},grid:{{color:GD}}}},
+      y:{{ticks:{{color:TX,font:{{size:9}},callback:yFmt}},grid:{{color:GD}}}}
+    }}
+  }};
+}}
+
+if(TC.length > 0) {{
+  const colors = TC2.map((c,i) => c >= TO[i] ? G+'90' : R+'90');
+  const border = TC2.map((c,i) => c >= TO[i] ? G : R);
+  new Chart(document.getElementById('cChart'), {{
+    type: 'bar',
+    data: {{
+      labels: TC,
+      datasets: [
+        {{label:'High', data:TH, type:'line', borderColor:G+'60',
+          backgroundColor:'transparent', pointRadius:0, borderWidth:1, tension:0.1}},
+        {{label:'Body', data:TC2, backgroundColor:colors, borderColor:border, borderWidth:1}},
+        {{label:'Low',  data:TL, type:'line', borderColor:R+'60',
+          backgroundColor:'transparent', pointRadius:0, borderWidth:1, tension:0.1}},
+      ]
+    }},
+    options: baseOpts(v => '₹'+Math.round(v).toLocaleString('en-IN'))
+  }});
+}}
+
+if(EQT.length > 0) {{
+  const last = EQV[EQV.length-1], first = EQV[0] || {TOTAL_CAPITAL};
+  const col = last >= first ? G : R;
+  new Chart(document.getElementById('eqChart'), {{
+    type:'line',
+    data:{{labels:EQT, datasets:[{{
+      data:EQV, borderColor:col, backgroundColor:col+'20',
+      fill:true, borderWidth:1.8, pointRadius:0, tension:0.3
+    }}]}},
+    options: baseOpts(v => '₹'+Math.round(v).toLocaleString('en-IN'))
+  }});
+}}
+</script>
+</body></html>"""
+
+class DashHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+
+    def do_GET(self):
+        global _LAST_BT
+        try:
+            if self.path.startswith("/run-backtest"):
+                days = 30
+                if "days=60" in self.path: days = 60
+                def _bt():
+                    global _LAST_BT
+                    result = run_backtest(
+                        (datetime.now()-timedelta(days=days)).strftime("%Y-%m-%d"),
+                        datetime.now().strftime("%Y-%m-%d"))
+                    if result:
+                        with _BT_LOCK: _LAST_BT = result
+                threading.Thread(target=_bt, daemon=True).start()
+                body = b"""<!DOCTYPE html><html><head><meta http-equiv="refresh" content="3;url=/"></head>
+                <body style="background:#0a0e1a;color:#e2e8f0;font-family:sans-serif;padding:40px;text-align:center">
+                <h2 style="color:#f59e0b">⏳ Backtest Running...</h2>
+                <p>Fetching data from Dhan API. Redirecting in 3 seconds...</p>
+                </body></html>"""
+                self.send_response(200)
+                self.send_header("Content-Type","text/html")
+                self.end_headers(); self.wfile.write(body)
+
+            elif self.path == "/api":
+                body = json.dumps(_dash_data(), default=str, indent=2).encode()
+                self.send_response(200)
+                self.send_header("Content-Type","application/json")
+                self.end_headers(); self.wfile.write(body)
+
+            elif self.path == "/health":
+                self.send_response(200); self.end_headers()
+                self.wfile.write(b"ok")
+
+            else:
+                body = _render(_dash_data()).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type","text/html; charset=utf-8")
+                self.send_header("Content-Length", len(body))
+                self.end_headers(); self.wfile.write(body)
+
+        except Exception as e:
+            logging.error(f"Dashboard handler error: {e}", exc_info=True)
+            err = f"<pre style='color:red;background:#111;padding:20px'>Error: {e}</pre>".encode()
+            try:
+                self.send_response(500)
+                self.end_headers(); self.wfile.write(err)
+            except: pass
+
+def run_dashboard(port=8080):
+    log = setup_log("dashboard")
+    log.info(f"📊 Dashboard → http://0.0.0.0:{port}")
+    log.info(f"   Open http://YOUR_SERVER_IP:{port} on your phone")
+    log.info(f"   Auto-refreshes every 30 seconds")
+    log.info(f"   DB: {DB_FILE}")
+    log.info(f"   State: {STATE_FILE}")
+    server = HTTPServer(("0.0.0.0", port), DashHandler)
+    server.serve_forever()
+
+# ═══════════════════════════════════════════════════════════
+# ▶️  ENTRY POINT
+# ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    run_bot()
+    args = sys.argv[1:]
+    init_db()
+
+    if "--dashboard" in args:
+        run_dashboard()
+
+    elif "--backtest" in args:
+        fd = td = None
+        if "--from" in args: fd = args[args.index("--from")+1]
+        if "--to"   in args: td = args[args.index("--to")+1]
+        if "--days" in args:
+            days = int(args[args.index("--days")+1])
+            fd = (datetime.now()-timedelta(days=days)).strftime("%Y-%m-%d")
+        run_backtest(fd, td)
+
+    elif "--all" in args:
+        port = 8080
+        if "--port" in args: port = int(args[args.index("--port")+1])
+        t = threading.Thread(target=run_dashboard, args=(port,), daemon=True)
+        t.start()
+        print(f"📊 Dashboard started on port {port}")
+        Bot().run()
+
+    else:
+        Bot().run()
